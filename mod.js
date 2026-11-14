@@ -129,8 +129,10 @@ m.byval = new Map(); m.T.forEach((t) => m.byval.set(t.byval, t.i));
 m.defs = new Map();
 for (let i = 0; i < m.fdv[1] / 12; i++) { const o = m.fdv[0] + i * 12; m.defs.set(dv.getInt32(o, true), dv.getInt32(o + 8, true)); }
 let gs = 0, gc = 0;
-for (let i = 0; i < m.imgs[1] / 40; i++) { const o = m.imgs[0] + i * 40; if (sname(dv.getInt32(o, true)) === "Assembly-CSharp.dll") { gs = dv.getInt32(o + 8, true); gc = dv.getInt32(o + 12, true); } }
+m.images = [];
+for (let i = 0; i < m.imgs[1] / 40; i++) { const o = m.imgs[0] + i * 40; const inm = sname(dv.getInt32(o, true)); m.images.push({ name: inm.replace(/\.dll$/, ""), start: dv.getInt32(o + 8, true), count: dv.getInt32(o + 12, true) }); if (inm === "Assembly-CSharp.dll") { gs = dv.getInt32(o + 8, true); gc = dv.getInt32(o + 12, true); } }
 m.gameStart = gs; m.gameCount = gc;
+m.assemblyOf = (ti) => { for (const im of m.images) if (ti >= im.start && ti < im.start + im.count) return im.name; return "Assembly-CSharp"; };
 m.name = (t) => { const T = typeof t === "number" ? m.T[t] : t; const n = sname(T.nm), ns = sname(T.ns); return (ns ? ns + "." : "") + n; };
 m.byName = new Map();
 m.T.forEach((t) => { const k = m.name(t); if (!m.byName.has(k)) m.byName.set(k, []); m.byName.get(k).push(t.i); });
@@ -392,11 +394,11 @@ R.methodByMI = (mi) => { const k = rw(mi + 12); if (!inHeap(k)) return null; ret
 
 // ---- subclasses and class lookup ----
 R.klassByName = (full) => { const l = R.cls(full); return l ? ((R.klassOf.get(l[0]) || [])[0] || 0) : 0; };
-// every metadata type whose runtime class is, or derives from, the named class (generic bases included)
-R.subTypes = (full) => {
-const key = full + "#" + R.kinv.size;
-const hit = R.subCache.get(key); if (hit) return hit;
-const base = R.cls(full); if (!base) return [];
+// every metadata type whose runtime class is, or derives from, the given class types (generic bases included)
+R.typesByShort = (short) => { const out = []; for (const [k, l] of R.meta.byName) if (k.slice(k.lastIndexOf(".") + 1) === short) for (const ti of l) out.push(ti); return out; };
+R.subTypesOf = (base, key) => {
+const ck = key + "#" + R.kinv.size;
+const hit = R.subCache.get(ck); if (hit) return hit;
 const baseK = new Set(); for (const ti of base) for (const k of (R.klassOf.get(ti) || [])) baseK.add(k);
 const out = new Set(base);
 if (R.L.parent) for (const [k, ti] of R.kinv) {
@@ -404,9 +406,70 @@ if (out.has(ti)) continue;
 let kk = rw(k + R.L.parent), g = 0;
 while (kk && inHeap(kk) && g++ < 14) { if (baseK.has(kk)) { out.add(ti); break; } kk = rw(kk + R.L.parent); }
 }
-const arr = Array.from(out); R.subCache.set(key, arr); return arr;
+const arr = Array.from(out); R.subCache.set(ck, arr); return arr;
 };
+R.subTypes = (full) => R.subTypesOf(R.cls(full) || [], full);
 R.findAll = (full) => { let out = []; for (const ti of R.subTypes(full)) out = out.concat(R.objs.get(ti) || []); return out; };
+
+// ---- liveness: the object scan also sees freed memory, so never call into an object that Unity has destroyed ----
+R.isLive = (obj) => { const f = R.fieldOf(obj, "m_CachedPtr"); if (!f) return true; return R.read(obj, f) !== 0; };
+R.liveAll = (full) => R.findAll(full).filter((o) => { try { return R.isLive(o); } catch (e) { return false; } });
+// the game's own singleton: its static instance field if it has one, otherwise the first live object
+R.singleton = (full) => {
+const k = R.klassByName(full); if (!k) return 0;
+for (const f of R.klassFields(k)) if (f.isStatic && /^(_?instance|s_?instance)$/i.test(f.name)) { try { const v = R.read(0, f); if (v && inHeap(v >>> 0) && R.klassName(rw(v >>> 0))) return v >>> 0; } catch (e) {} }
+return R.liveAll(full)[0] || 0;
+};
+// turn whatever a failed call threw into a readable message
+R.explain = (e) => {
+if (typeof e === "number") {
+const p = e >>> 0, i = inHeap(p) ? R.inspect(p) : null;
+if (i) { let msg = ""; const f = R.fieldOf(p, "_message") || R.fieldOf(p, "message"); if (f) { const s = R.readStr(R.read(p, f)); if (s) msg = ": " + s; } return "managed exception " + i.name + msg; }
+return "the game threw " + e;
+}
+const s = String(e && e.message || e);
+if (/abort\(/.test(s)) return s + " (an unhandled managed exception inside the game; usually the game is not in the right state, for example no run is active)";
+return s;
+};
+R.shortType = (n) => {
+const M2 = { "System.Int32": "int", "System.Single": "float", "System.Double": "double", "System.Boolean": "bool", "System.String": "string", "System.Void": "void", "System.Int64": "long", "System.UInt64": "ulong", "System.UInt32": "uint", "System.Int16": "short", "System.UInt16": "ushort", "System.Byte": "byte", "System.SByte": "sbyte", "System.Char": "char", "System.Object": "object" };
+if (!n) return "object"; if (M2[n]) return M2[n];
+return n.slice(n.lastIndexOf(".") + 1).replace(/`\d+$/, "");
+};
+// a read-only C# view of a class built from the metadata (bodies are compiled to native code, so they cannot be shown)
+R.classSource = (ti) => {
+const m = R.meta, t = m.T[ti], full = m.name(ti), sh = R.shortType;
+const k = (R.klassOf.get(ti) || [])[0] || 0;
+const isEnum = m.isEnum(ti), isIface = !!(t.flags & 0x20);
+const pti = t.parent >= 0 ? m.byval.get(t.parent) : undefined;
+const baseName = pti !== undefined ? m.name(pti) : (k && R.L.parent && rw(k + R.L.parent) ? R.klassName(rw(k + R.L.parent)) : "");
+const isStruct = baseName === "System.ValueType";
+const kw = isEnum ? "enum" : isIface ? "interface" : isStruct ? "struct" : "class";
+const vis = ((t.flags & 7) === 1 || (t.flags & 7) === 2) ? "public " : "internal ";
+const mods = kw === "class" ? ((t.flags & 0x80) && (t.flags & 0x100) ? "static " : (t.flags & 0x80) ? "abstract " : (t.flags & 0x100) ? "sealed " : "") : "";
+const L = [];
+L.push("// Namespace: " + m.sname(t.ns));
+L.push("// Assembly: " + m.assemblyOf(ti) + "   TypeDefIndex: " + ti + (k ? "   Il2CppClass: " + hex(k) : "   (no runtime class)"));
+L.push(vis + mods + kw + " " + sh(full) + (baseName && !isEnum && !isStruct && baseName !== "System.Object" ? " : " + sh(baseName) : "") + "\n{");
+const rf = k ? R.fieldsOfKlass(k) : [];
+L.push("\t// Fields");
+for (let j = 0; j < t.fc; j++) {
+const fi = t.fs + j, nm = m.sname(m.dv.getInt32(m.flds[0] + fi * 12, true)), r = rf.find((x) => x.name === nm);
+if (isEnum) { if (nm === "value__") continue; const d = m.defs.get(fi); L.push("\t" + nm + " = " + (d !== undefined ? m.dv.getInt32(m.fdd[0] + d, true) : "?") + ","); continue; }
+const ty = r ? (r.kind === "array" ? "array" : r.kind === "generic" ? "generic" : sh(r.tn)) : "?";
+L.push("\t" + (r && r.isStatic ? "static " : "") + (r && r.isConst ? "const " : "") + ty + " " + nm + ";" + (r && !r.isConst ? " // 0x" + r.off.toString(16).toUpperCase() : ""));
+}
+const md = m.methodsOf(ti), rm = k ? R.methodsOfKlass(k).slice() : [];
+if (md.length) L.push("\n\t// Methods");
+for (const x of md) {
+const a = x.flags & 7, acc = a === 6 ? "public " : a === 4 ? "protected " : a === 5 ? "protected internal " : a === 3 ? "internal " : "private ";
+const ps = x.pars.map((p) => sh(m.tname(p.typeIdx)) + " " + p.name).join(", ");
+const ri = rm.findIndex((y) => y.name === x.name && y.pars.length === x.pars.length), r = ri >= 0 ? rm.splice(ri, 1)[0] : null;
+L.push("\t" + acc + (x.flags & 0x10 ? "static " : "") + ((x.flags & 0x400) ? "abstract " : (x.flags & 0x40) ? "virtual " : "") + sh(m.tname(x.ret)) + " " + x.name + "(" + ps + ") { }" + (r ? " // fn " + r.fn : ""));
+}
+L.push("}");
+return L.join("\n");
+};
 
 // ---- calls: through the wasm function table, the same entry the game's own indirect calls use ----
 const PRIM = new Set(["System.Int32", "System.UInt32", "System.Int16", "System.UInt16", "System.Byte", "System.SByte", "System.Boolean", "System.Char", "System.IntPtr", "System.UIntPtr"]);
@@ -476,12 +539,14 @@ a.push(v === true ? 1 : v === false ? 0 : v === null || v === undefined ? 0 : (v
 a.push(m.mi); sig += "i";
 const T = R.table(), fn = T ? T.get(m.fn) : null;
 let r;
+try {
 if (fn) r = fn.apply(null, a);
 else {
 if (sig.indexOf("j") >= 0) throw new Error("64-bit values need the wasm function table, which this build does not expose");
 const f = M["dynCall_" + sig]; if (!f) throw new Error("no dynCall_" + sig + " in this build");
 r = f.apply(null, [m.fn].concat(a));
 }
+} catch (e) { throw new Error(m.owner + "." + m.name + ": " + R.explain(e)); }
 if (sret) { const out = []; for (let i = 0; i < sret; i++) out.push(M.HEAPF32[(sbuf >> 2) + i]); return out; }
 if (typeof r === "bigint") r = Number(r);
 return r;
@@ -582,9 +647,10 @@ function ovRelease(group) {
 for (const [k, o] of OV) if (group === "*" || o.group === group) { try { RT.write(o.obj, o.f, o.orig); } catch (e) {} OV.delete(k); }
 }
 const ovCount = (group) => { let n = 0; for (const o of OV.values()) if (o.group === group) n++; return n; };
-function defGroup(id, resolve, onChange) { GROUPS.set(id, { on: false, resolve, onChange, sig: -1 }); }
+function defGroup(id, resolve, onChange, guard) { GROUPS.set(id, { on: false, resolve, onChange, guard, sig: -1 }); }
 function setGroup(id, on) {
 const g = GROUPS.get(id); if (!g) return;
+if (on && g.guard && !g.guard()) return;
 g.on = on;
 if (!on) { ovRelease(id); if (g.onChange) { try { g.onChange(); } catch (e) {} } g.sig = -1; } else runGroups();
 }
@@ -710,14 +776,56 @@ const gp = RT.findMethod(RT.rw(tr), "get_position", 0);
 return gp ? RT.invoke(gp, tr, []) : null;
 }
 
+// ---------- run state, names ----------
+// true while a run is active: Game.IsInGame is a Variable<bool>
+function inRun() {
+if (!RT || !RT.ok) return false;
+const g = RT.singleton("SYBO.Subway.Game"); if (!g) return false;
+const f = RT.fieldOf(g, "IsInGame"); if (!f) return true;
+const v = RT.read(g, f); if (!v) return false;
+const vf = RT.klassFields(RT.rw(v)).find((x) => !x.isStatic && x.kind === "bool");
+return vf ? !!RT.read(v, vf) : true;
+}
+const nameMemo = new Map();
+function unityName(p) {
+try {
+if (!p || !RT.isLive(p)) return null;
+const m = RT.methodsChain(RT.rw(p)).find((x) => x.name === "get_name" && x.pars.length === 0 && !x.static);
+if (!m) return null;
+const r = RT.invokeF(m, p, []); return typeof r === "string" ? r : null;
+} catch (e) { return null; }
+}
+let nameCache = { t: 0, list: [] };
+// every live GameObject with its Unity name (cached for a few seconds)
+function objectNames(force) {
+if (!RT || !RT.ok) return [];
+if (!force && Date.now() - nameCache.t < 5000) return nameCache.list;
+const list = [], base = RT.cls("UnityEngine.GameObject") || [];
+for (const ti of RT.subTypesOf(base, "UnityEngine.GameObject")) for (const o of (RT.objs.get(ti) || [])) { const n = unityName(o); if (n) list.push({ ptr: o, name: n }); }
+nameCache = { t: Date.now(), list }; return list;
+}
+function findByName(name) {
+const q = String(name).toLowerCase(), all = objectNames();
+let hit = all.filter((x) => x.name.toLowerCase() === q);
+if (!hit.length) hit = all.filter((x) => x.name.toLowerCase() === q + "(clone)");
+if (!hit.length) hit = all.filter((x) => x.name.toLowerCase().indexOf(q) >= 0);
+return hit;
+}
+
 // ---------- chunk weights ----------
 // The picks come from cached lists (_randomlyOrderedPrefabs, _weightedRandomizedPrefabs) that are built from the weights, so after
-// the weights change the game's own BuildRandomlyOrderedPrefabList(SyboRandom) has to run. Subclasses (route chunk containers) included.
+// the weights change the game's own BuildRandomlyOrderedPrefabList(SyboRandom) has to run (only while a run is active).
 const C_CONT = "SYBO.Subway.Routes.WeightRandomizedPrefabContainter`2";
 const C_RANDOM = "SYBO.Common.Utilities.SyboRandom";
+function entryName(e, nm) {
+let name = nm ? (RT.readStr(RT.read(e, nm)) || "") : "";
+if (!name) { for (const n of ["_prefab", "Prefab", "prefab"]) { const f = RT.fieldOf(e, n); if (f) { const pn = unityName(RT.read(e, f)); if (pn) { name = pn; break; } } } }
+return name || "?";
+}
 function chunkContainers() {
 const out = [];
 if (!RT || !RT.ok) return out;
+const seen = new Set();
 for (const c of RT.findAll(C_CONT)) {
 try {
 const lf = RT.fieldOf(c, "_weightedPrefabs"); if (!lf) continue;
@@ -726,20 +834,35 @@ const nf = RT.fieldOf(c, "<Name>k__BackingField");
 const name = nf ? RT.readStr(RT.read(c, nf)) : null;
 const entries = RT.listItems(list).filter((e) => RT.inHeap(e)).map((e) => {
 const wf = RT.fieldOf(e, "Weight"), nm = RT.fieldOf(e, "_name");
-return { addr: e, wf, name: nm ? (RT.readStr(RT.read(e, nm)) || "?") : "?" };
+return { addr: e, wf, name: entryName(e, nm) };
 }).filter((e) => e.wf);
+entries.forEach((e) => seen.add(e.addr));
 if (entries.length) out.push({ addr: c, name: name || "(unnamed)", entries });
 } catch (e) { /* skip */ }
 }
+// weighted entries that no container list reached (grouped by their class), so chunk names are always listed when they exist in memory
+try {
+const groups = new Map();
+for (const ti of RT.subTypesOf(RT.typesByShort("WeightedPrefab`1"), "WeightedPrefab`1")) for (const o of (RT.objs.get(ti) || [])) {
+if (seen.has(o)) continue;
+const wf = RT.fieldOf(o, "Weight"); if (!wf) continue;
+const g = RT.meta.name(ti).split(".").pop();
+if (!groups.has(g)) groups.set(g, []);
+groups.get(g).push({ addr: o, wf, name: entryName(o, RT.fieldOf(o, "_name")) });
+}
+for (const [g, entries] of groups) out.push({ addr: "loose:" + g, name: g + " (all loaded entries)", entries: entries.slice(0, 400), loose: true });
+} catch (e) { /* skip */ }
 return out;
 }
 function rebuildContainers() {
-if (!RT || !RT.ok) return 0;
-const rnd = RT.find(C_RANDOM)[0];
-if (!rnd) { dlog("no live SyboRandom yet, chunk lists will rebuild on their own"); return 0; }
+if (!RT || !RT.ok || !inRun()) return 0;
+const gm = RT.singleton("SYBO.Subway.Game"); let rnd = 0;
+if (gm) { const f = RT.fieldOf(gm, "_randomGenerator"); if (f) rnd = RT.read(gm, f); }
+if (!rnd) rnd = RT.liveAll(C_RANDOM)[0] || 0;
+if (!rnd) { dlog("no SyboRandom yet, the chunk lists rebuild on their own"); return 0; }
 let n = 0;
 for (const c of RT.findAll(C_CONT)) {
-try { const m = RT.findMethod(RT.rw(c), "BuildRandomlyOrderedPrefabList", 1); if (m) { RT.invoke(m, c, [rnd]); n++; } } catch (e) { /* container not ready */ }
+try { const m = RT.findMethod(RT.rw(c), "BuildRandomlyOrderedPrefabList", 1); if (m) { RT.invoke(m, c, [rnd]); n++; } } catch (e) { dlog("chunk rebuild: " + e.message); break; }
 }
 return n;
 }
@@ -747,7 +870,7 @@ const chunkRule = { mode: "first", text: "" };
 defGroup("chunkrule", () => {
 const out = [];
 for (const c of chunkContainers()) {
-if (c.entries.length < 2) continue;
+if (c.loose || c.entries.length < 2) continue;
 let keep = c.entries[0];
 if (chunkRule.mode === "match" && chunkRule.text) { const t = chunkRule.text.toLowerCase(); const hit = c.entries.find((e) => e.name.toLowerCase().indexOf(t) >= 0); if (!hit) continue; keep = hit; }
 for (const e of c.entries) if (e !== keep) out.push([e.addr, e.wf, 0]);
@@ -765,91 +888,46 @@ const NSP = "SYBO.Subway.Pickups.";
 const P_DATA = NSP + "PickupData", P_SPOT = NSP + "PickupSpawnPoint", P_TYPE = NSP + "PickupType", P_MODE = NSP + "SpawnPointMode", P_MGR = NSP + "PickupManager", P_PICKER = NSP + "Pickers.PickerData", P_BASE = NSP + "Picker.Pickers.BasePicker";
 const pk = { force: "JetPack" };
 function pickupTypeValue(name) { const e = RT && RT.ok ? RT.enumOf(P_TYPE).find((x) => x.name === name) : null; return e ? e.value : 0; }
-const forcedTag = new Map();
-// the game's own forcing call: SetSpawnPointForced(type, difficulty, offsetY, ignoreZ, ignoreJetpackZ) sets the mode, the type and the "Original" copies
-function forceSpot(obj, tv, modeVal) {
-const fm = RT.fieldOf(obj, "__spawnPointMode"), ft = RT.fieldOf(obj, "__forceSpawnPickupType");
-if (fm && ft && forcedTag.get(obj) === tv && RT.read(obj, fm) === modeVal && RT.read(obj, ft) === tv) return;
-const m = RT.findMethod(RT.rw(obj), "SetSpawnPointForced", 5); if (!m) return;
-const fd = RT.fieldOf(obj, "_spawnPointDifficulty");
-try { RT.invoke(m, obj, [tv, fd ? RT.read(obj, fd) : 1, false, true, true]); forcedTag.set(obj, tv); } catch (e) { /* object not ready */ }
-}
+// Only plain number writes here. Calling SetSpawnPointForced / SpawnPickup from outside, or widening enums, made the game throw inside its own
+// update loop, so the flood now just turns the spawn knobs all the way up and forces the type at every spawn point.
 defGroup("force", () => {
 const out = [], mode = RT.enumOf(P_MODE).find((x) => x.name === "WillForcePickupType"), val = pickupTypeValue(pk.force);
 if (!mode || !val) return out;
 for (const obj of RT.find(P_SPOT)) {
-forceSpot(obj, val, mode.value);
+if (!RT.isLive(obj)) continue;
 const f1 = RT.fieldOf(obj, "__spawnPointMode"), f2 = RT.fieldOf(obj, "__forceSpawnPickupType");
 if (f1 && f2) { out.push([obj, f1, mode.value]); out.push([obj, f2, val]); }
 }
 return out;
 });
 defGroup("nospace", () => { const out = []; eachField(P_DATA, "_spawnDistanceMinToPrevious", (o, f) => out.push([o, f, 0])); return out; });
-
-// flood: every picker rolls every time with no spacing, the chosen PickupData is enabled and compatible with all spawn points, every spawn
-// point is forced through SetSpawnPointForced, blocked ones are re-armed, and spawn points ahead of you get SpawnPickup called right away.
-const flooded = new Set();
-function floodHooks(on) {
-if (on) { for (const [n, v] of [["get_ProbabilityToSpawn", 1.0], ["get_SpawnDistanceMinToPrevious", 0.0]]) { if (!HK.size || !HOOKS.list().some((r) => r.cls === "BasePicker" && r.name === n)) { try { HOOKS.constant(P_BASE, n, 0, v); } catch (e) { dlog("flood hook " + n + ": " + e.message); } } } }
-else HOOKS.list().filter((r) => r.cls === "BasePicker").forEach((r) => HOOKS.off(r));
-}
-function floodSpawn(tv, mgr) {
-if (!mgr) return;
-const gd = RT.findMethod(RT.rw(mgr), "GetPickupDataForPickupType", 1); if (!gd) return;
-const pdata = RT.invoke(gd, mgr, [tv]) >>> 0; if (!pdata) return;
-const fa = RT.fieldOf(mgr, "_pickerData"); const arr = fa ? RT.arrayItems(RT.read(mgr, fa)) : [];
-let picker = 0;
-for (const p of arr) { const f = RT.fieldOf(p, "_pickerType"); if (f && RT.read(p, f) === 1) { picker = p; break; } }
-if (!picker) picker = arr[0] || 0; if (!picker) return;
-const me = RT.find("SYBO.Subway.Characters.Character")[0]; const p0 = me ? posOfObj(me) : null;
-let budget = 24;
-for (const sp of RT.find(P_SPOT)) {
-if (budget <= 0) break;
-try {
-const fs = RT.fieldOf(sp, "__spawnPointState"); if (!fs) continue;
-const st = RT.read(sp, fs);
-if (st !== 0 && st !== 1) continue;
-const pos = posOfObj(sp);
-if (p0 && pos && (pos[2] < p0[2] + 2 || pos[2] > p0[2] + 260)) continue; // only the road ahead
-if (st === 1) RT.write(sp, fs, 0);
-const avail = RT.findMethod(RT.rw(sp), "IsAvailableForSpawning", 1), spawn = RT.findMethod(RT.rw(sp), "SpawnPickup", 2);
-if (!spawn || (avail && !RT.invoke(avail, sp, [false]))) continue;
-RT.invoke(spawn, sp, [pdata, picker]); budget--;
-} catch (e) { /* spawn point not ready */ }
-}
-}
 defGroup("flood", () => {
 const out = [], tv = pickupTypeValue(pk.force), mode = RT.enumOf(P_MODE).find((x) => x.name === "WillForcePickupType");
 if (!tv || !mode) return out;
 for (const o of RT.find(P_PICKER)) {
 try {
-const fT = RT.fieldOf(o, "_pickupType"), fP = RT.fieldOf(o, "_probabilityToSpawn"), fD = RT.fieldOf(o, "_spawnDistanceMinToPrevious"), fK = RT.fieldOf(o, "_pickerType"), fE = RT.fieldOf(o, "_pickerEnabledState");
+const fT = RT.fieldOf(o, "_pickupType"), fP = RT.fieldOf(o, "_probabilityToSpawn"), fD = RT.fieldOf(o, "_spawnDistanceMinToPrevious");
 if (fP) out.push([o, fP, 1]);
 if (fD) out.push([o, fD, 0]);
-if (fT) out.push([o, fT, (RT.read(o, fT) | tv) | 0]);
-if (fE && fK && RT.read(o, fK) === 1) out.push([o, fE, 0]);
+if (fT) out.push([o, fT, (RT.read(o, fT) | tv) | 0]); // PickupType is a flags mask
 } catch (e) {}
 }
 for (const o of RT.find(P_DATA)) {
 try {
-const fT = RT.fieldOf(o, "_pickupType"); if (!fT) continue;
-const mine = RT.read(o, fT) === tv, w = RT.fieldOf(o, "_spawnWeight");
-if (w) out.push([o, w, mine ? 1000 : 0]);
-if (!mine) continue;
-for (const [n, v] of [["_pickupEnabledState", 0], ["_spawnDistanceMinToPrevious", 0], ["_spawnPointDifficulty", 255], ["_spawnPointHeight", 255]]) { const f = RT.fieldOf(o, n); if (f) out.push([o, f, v]); }
+const fT = RT.fieldOf(o, "_pickupType"); if (!fT || RT.read(o, fT) !== tv) continue;
+const w = RT.fieldOf(o, "_spawnWeight"), d = RT.fieldOf(o, "_spawnDistanceMinToPrevious");
+if (w) out.push([o, w, Math.max(1000, RT.read(o, w))]);
+if (d) out.push([o, d, 0]);
 } catch (e) {}
 }
 for (const o of RT.find(P_SPOT)) {
 try {
-forceSpot(o, tv, mode.value);
-for (const [n, v] of [["__spawnPointMode", mode.value], ["_spawnPointModeOriginal", mode.value], ["__forceSpawnPickupType", tv], ["_forceSpawnPickupTypeOriginal", tv], ["__willIgnoreZPositionBeforeSpawn", true], ["_willIgnoreZPositionBeforeSpawnOriginal", true], ["_ignoreJetpackZ", true]]) { const f = RT.fieldOf(o, n); if (f) out.push([o, f, f.kind === "bool" ? !!v : v]); }
+if (!RT.isLive(o)) continue;
+for (const [n, v] of [["__spawnPointMode", mode.value], ["_spawnPointModeOriginal", mode.value], ["__forceSpawnPickupType", tv], ["_forceSpawnPickupTypeOriginal", tv]]) { const f = RT.fieldOf(o, n); if (f) out.push([o, f, v]); }
 } catch (e) {}
 }
-const mgr = RT.find(P_MGR)[0];
-if (mgr) { for (const n of ["_spawnDistanceMinToGameStart", "SpawnDistanceMinToCharacter"]) { const f = RT.fieldOf(mgr, n); if (f) out.push([mgr, f, 0]); } }
-floodSpawn(tv, mgr);
 return out;
-}, () => floodHooks(groupOn("flood")));
+});
 function pickupRows() {
 const rows = [];
 if (!RT || !RT.ok) return rows;
@@ -874,8 +952,23 @@ const TUNE = [
 ];
 TUNE.forEach((t) => { if (S.vals[t.id] === undefined) S.vals[t.id] = t.def; defGroup(t.id, () => { const out = []; for (const [c, f] of t.cls) eachField(c, f, (o, fl) => out.push([o, fl, S.vals[t.id]])); return out; }); });
 
-// ---------- developer settings (the developers' own DebugSettings object, and its static setters) ----------
+// ---------- developer settings (the developers' own DebugSettings singleton) ----------
+// The game only creates DebugSettings when something asks for its instance, so in a normal run it does not exist.
+// The first switch tells you so; switching again asks the game for its instance (may abort if the prefab is missing).
 const DEVC = "SYBO.Subway.Utilities.DebugSettings";
+let devArmed = false;
+function devEnsure() {
+if (!RT || !RT.ok) { say("not connected yet, wait for the green dot"); return false; }
+if (RT.liveAll(DEVC).length) return true;
+if (!devArmed) { devArmed = true; say("DebugSettings does not exist yet. Switch it again to try creating it (the game may abort)"); return false; }
+devArmed = false;
+try {
+const k = RT.klassByName(DEVC), m = k && RT.methodsChain(k).find((x) => x.static && /^get_instance$/i.test(x.name) && x.pars.length === 0);
+if (!m) { say("this build has no instance getter for DebugSettings"); return false; }
+RT.invoke(m, 0, []); RT.refresh(false); say("DebugSettings created, switch it on once more");
+} catch (e) { say("could not create DebugSettings: " + e.message); }
+return false;
+}
 const DEV = [
 { f: "_characterInvincible", title: "Character invincible", sub: "crashes cannot end the run", set: "set_CharacterInvincible" },
 { f: "_unlockedSceneCamera", title: "Free scene camera", sub: "unlocks the camera" },
@@ -883,17 +976,24 @@ const DEV = [
 { f: "_useDebugZDistanceTargetPosition", title: "Debug distance target", sub: "start the run far ahead", set: "set_UseDebugZDistanceTargetPosition" },
 { f: "_useQueuedEnvironmentKinds", title: "Use queued environments", sub: "force the world look queue", set: "set_UseQueuedEnvironmentKinds" }
 ];
-DEV.forEach((d) => defGroup("dev" + d.f, () => { const out = []; eachField(DEVC, d.f, (o, f) => out.push([o, f, f.kind === "bool" ? true : 1])); return out; }, d.set ? () => { try { callStatic(DEVC, d.set, [groupOn("dev" + d.f)]); } catch (e) { dlog(d.set + ": " + e.message); } } : null));
-defGroup("dev_active", () => { const out = []; eachField(DEVC, "_active", (o, f) => out.push([o, f, f.kind === "bool" ? true : (S.vals.devActive || 1)])); return out; });
+const liveDev = (cb) => { for (const o of RT.liveAll(DEVC)) { try { const f = RT.fieldOf(o, cb.f); if (f) cb.fn(o, f); } catch (e) {} } };
+DEV.forEach((d) => defGroup("dev" + d.f, () => { const out = []; liveDev({ f: d.f, fn: (o, f) => out.push([o, f, f.kind === "bool" ? true : 1]) }); return out; }, null, devEnsure));
+defGroup("dev_active", () => { const out = []; liveDev({ f: "_active", fn: (o, f) => out.push([o, f, f.kind === "bool" ? true : (S.vals.devActive || 1)]) }); return out; }, null, devEnsure);
 
-// ---------- wallet: the game's own InventorySave.IncreaseCoins(int, string) / IncreaseKeys(int, string) ----------
+// ---------- wallet: the game's own static SetCoins/SetKeys (IncreaseCoins fires analytics and listeners that abort in this build) ----------
 const INV = "Data.Save.InventorySave";
 function walletAdd(kind, n) {
-const name = kind === "coins" ? "IncreaseCoins" : "IncreaseKeys";
-try { callStatic(INV, name, [n, "ssmod"]); return; } catch (e) { dlog(name + " failed (" + e.message + "), using Set" + (kind === "coins" ? "Coins" : "Keys")); }
-const cur = callStatic(INV, kind === "coins" ? "get_coins" : "get_keys", []) | 0;
-callStatic(INV, kind === "coins" ? "SetCoins" : "SetKeys", [Math.max(0, Math.min(2000000000, cur + n))]);
+if (!RT || !RT.ok) throw new Error("not connected yet");
+if (!RT.singleton(INV)) throw new Error("the save data is not loaded yet, open the main menu first");
+const get = kind === "coins" ? "get_coins" : "get_keys", set = kind === "coins" ? "SetCoins" : "SetKeys";
+const before = RT.staticCall(INV, get, []) | 0;
+RT.staticCall(INV, set, [Math.max(0, Math.min(2000000000, before + Math.round(n)))]);
+return before + " -> " + (RT.staticCall(INV, get, []) | 0);
 }
+
+// ---------- safety net: if the game aborts, let go of everything we were holding ----------
+function releaseAll() { try { GROUPS.forEach((g) => { g.on = false; }); ovRelease("*"); HOOKS.off(); } catch (e) {} }
+addEventListener("error", (ev) => { const msg = String(ev && ev.message || ""); if (/abort\(/.test(msg) && (OV.size || HK.size)) { releaseAll(); dlog("the game aborted, all mod writes and hooks were released"); } });
 
 // ---------- boot: connect automatically and keep the object list fresh ----------
 let uiOpen = { explorer: false, spawn: false };
@@ -910,240 +1010,553 @@ if (need) await RT.refresh(false);
 setInterval(() => { bootTick().catch((e) => dlog("boot: " + e)); }, 1000);
 
 // ===================================================================================================
-// CODE TAB ENGINE: a C# style invoker/patcher over the live IL2CPP runtime.
-//   Class.Method(args)            static call (instance methods on a class use the first live object)
-//   var o = find(Class)           first live object;  findAll(Class) lists them
-//   o.Method(args)  o.field  o.field = v  o.Prop = v      real methods, real field offsets, properties via get_/set_
-//   Class.staticField = v         static fields;  PickupType.JetPack  enum names
-//   foreach (var o in Class) o.field = 5
-//   hold o.field = v              keeps writing it, release undoes it
-//   hook Class.Method(2) => expr  patch Class.Method => value | nop     unhook Class.Method | all    hooks
-//   peek(addr) poke(addr, v) str(ptr) typeof(ptr) Vector3(1,2,3)
+// CODE TAB ENGINE: a C# subset (lexer + parser + interpreter) over the live IL2CPP runtime, and a translator to
+// frida-il2cpp-bridge JavaScript. Supported: var/typed declarations, if/else, while, for, foreach, blocks, break/continue/return,
+// operators, ?:, ??, casts, $"strings", Class.Method(args), obj.Prop, obj.field = v, new Vector3(...), arrays/lists, find("Name"),
+// plus the commands hook / patch / unhook / hold / release / hooks / print / help.
 // ===================================================================================================
 class Ptr { constructor(v) { this.v = v >>> 0; } }
-const CSK = new Set(["var", "int", "float", "double", "bool", "string", "long", "uint", "object"]);
-let csIdx = { n: -1, short: new Map() };
-function csShort() {
-const m = RT.meta; if (csIdx.n === m.T.length) return csIdx.short;
-const sh = new Map();
-for (let i = 0; i < m.T.length; i++) {
-const full = m.name(i); const last = full.slice(full.lastIndexOf(".") + 1).replace(/`\d+$/, "");
-if (!last || /[<>]/.test(last)) continue;
-let l = sh.get(last); if (!l) sh.set(last, l = []); if (l.indexOf(full) < 0) l.push(full);
+const CS_PRIM = new Set(["var", "int", "float", "double", "bool", "string", "long", "uint", "object", "short", "byte", "char", "ulong", "decimal", "sbyte", "ushort"]);
+const CS_CMD = new Set(["hook", "patch", "unhook", "hold", "release", "hooks", "help"]);
+
+// ---------- lexer ----------
+function csLex(src) {
+const toks = []; let i = 0, line = 1; const n = src.length;
+const push = (t, v, st, x) => toks.push(Object.assign({ t, v, line, pos: st, end: i }, x || {}));
+while (i < n) {
+const c = src[i];
+if (c === "\n") { line++; i++; continue; }
+if (/\s/.test(c)) { i++; continue; }
+if (c === "/" && src[i + 1] === "/") { while (i < n && src[i] !== "\n") i++; continue; }
+if (c === "/" && src[i + 1] === "*") { i += 2; while (i < n && !(src[i] === "*" && src[i + 1] === "/")) { if (src[i] === "\n") line++; i++; } i += 2; continue; }
+if (c === '"' || ((c === "$" || c === "@") && src[i + 1] === '"')) {
+const st = i, verb = c === "@", interp = c === "$"; if (c !== '"') i++; i++;
+let s = "";
+while (i < n && src[i] !== '"') { if (src[i] === "\\" && !verb) { const e = src[i + 1]; s += e === "n" ? "\n" : e === "t" ? "\t" : e; i += 2; } else { if (src[i] === "\n") line++; s += src[i++]; } }
+i++; push("str", s, st, { interp }); continue;
 }
-csIdx = { n: m.T.length, short: sh }; return sh;
+if (c === "'") { const st = i; i++; let s = ""; while (i < n && src[i] !== "'") { if (src[i] === "\\") { s += src[i + 1]; i += 2; } else s += src[i++]; } i++; push("str", s, st); continue; }
+if (/[0-9]/.test(c) || (c === "." && /[0-9]/.test(src[i + 1] || ""))) {
+const st = i; let j = i;
+if (c === "0" && /[xX]/.test(src[i + 1] || "")) { j += 2; while (/[0-9a-fA-F]/.test(src[j] || "")) j++; const v = parseInt(src.slice(i, j), 16); i = j; push("num", v, st); continue; }
+while (/[0-9]/.test(src[j] || "")) j++;
+if (src[j] === "." && /[0-9]/.test(src[j + 1] || "")) { j++; while (/[0-9]/.test(src[j] || "")) j++; }
+if (/[eE]/.test(src[j] || "") && /[-+0-9]/.test(src[j + 1] || "")) { j += 2; while (/[0-9]/.test(src[j] || "")) j++; }
+const v = parseFloat(src.slice(i, j)); if (/[fFdDmMuUlL]/.test(src[j] || "")) j++; i = j; push("num", v, st); continue;
+}
+if (/[A-Za-z_@]/.test(c)) { const st = i; let j = i + 1; while (/[A-Za-z0-9_]/.test(src[j] || "")) j++; const v = src.slice(i, j).replace(/^@/, ""); i = j; push("id", v, st); continue; }
+const two = src.substr(i, 2), st = i;
+if (["==", "!=", "<=", ">=", "&&", "||", "+=", "-=", "*=", "/=", "%=", "++", "--", "=>", "?.", "??"].indexOf(two) >= 0) { i += 2; push("op", two, st); continue; }
+i++; push("op", c, st);
+}
+toks.push({ t: "eof", v: "", line, pos: n, end: n });
+return toks;
+}
+
+// ---------- parser ----------
+class CsParser {
+constructor(src) { this.src = src; this.toks = csLex(src); this.p = 0; }
+get tk() { return this.toks[this.p]; }
+peek(o) { return this.toks[Math.min(this.p + (o || 0), this.toks.length - 1)]; }
+isOp(v, o) { const t = this.peek(o); return t.t === "op" && t.v === v; }
+isId(v, o) { const t = this.peek(o); return t.t === "id" && (v === undefined || t.v === v); }
+err(m) { throw new Error("line " + this.tk.line + ": " + m); }
+eatOp(v) { if (this.isOp(v)) { this.p++; return true; } return false; }
+needOp(v) { if (!this.eatOp(v)) this.err("expected '" + v + "' but found '" + (this.tk.v || "end of code") + "'"); }
+endStmt() { if (this.eatOp(";")) return; const t = this.tk, prev = this.toks[this.p - 1]; if (t.t === "eof" || this.isOp("}") || (prev && t.line > prev.line)) return; this.err("expected ';' but found '" + t.v + "'"); }
+program() { const out = []; while (this.tk.t !== "eof") out.push(this.stmt()); return out; }
+block() { this.needOp("{"); const b = []; while (!this.isOp("}")) { if (this.tk.t === "eof") this.err("missing '}'"); b.push(this.stmt()); } this.needOp("}"); return { k: "block", b }; }
+// does a declaration start here: Type name = / Type name ;
+looksLikeDecl() {
+let o = 0;
+if (!this.isId(undefined, o)) return false;
+if (CS_PRIM.has(this.peek(o).v)) { o++; } else {
+o++; while (this.isOp(".", o) && this.isId(undefined, o + 1)) o += 2;
+if (this.isOp("<", o)) { let d = 0; for (;;) { const t = this.peek(o); if (t.t === "eof") return false; if (t.t === "op" && t.v === "<") d++; else if (t.t === "op" && t.v === ">") { d--; if (!d) { o++; break; } } else if (!(t.t === "id" || (t.t === "op" && (t.v === "," || t.v === ".")))) return false; o++; } }
+}
+if (this.isOp("[", o) && this.isOp("]", o + 1)) o += 2;
+if (!this.isId(undefined, o) || CS_PRIM.has(this.peek(o).v)) return false;
+return this.isOp("=", o + 1) || this.isOp(";", o + 1) || (this.peek(o + 1).t === "eof");
+}
+declType() { const t = this.tk.v; if (CS_PRIM.has(t)) { this.p++; } else { this.p++; while (this.isOp(".") && this.isId(undefined, 1)) this.p += 2; if (this.isOp("<")) { let d = 0; do { if (this.isOp("<")) d++; else if (this.isOp(">")) d--; this.p++; } while (d > 0 && this.tk.t !== "eof"); } } if (this.isOp("[") && this.isOp("]", 1)) this.p += 2; }
+decl() { this.declType(); const n = this.tk.v; this.p++; let e = null; if (this.eatOp("=")) e = this.expr(); return { k: "var", n, e }; }
+stmt() {
+const t = this.tk;
+if (t.t === "op") { if (t.v === "{") return this.block(); if (t.v === ";") { this.p++; return { k: "block", b: [] }; } }
+if (t.t === "id") {
+const w = t.v;
+if (w === "const") { this.p++; return this.stmt(); }
+if (w === "if") { this.p++; this.needOp("("); const c = this.expr(); this.needOp(")"); const a = this.stmt(); let b = null; if (this.isId("else")) { this.p++; b = this.stmt(); } return { k: "if", c, a, b }; }
+if (w === "while") { this.p++; this.needOp("("); const c = this.expr(); this.needOp(")"); return { k: "while", c, b: this.stmt() }; }
+if (w === "for") { this.p++; this.needOp("("); let init = null; if (!this.isOp(";")) init = this.looksLikeDecl() ? this.decl() : { k: "expr", e: this.expr() }; this.needOp(";"); const c = this.isOp(";") ? null : this.expr(); this.needOp(";"); const st = this.isOp(")") ? null : this.expr(); this.needOp(")"); return { k: "for", init, c, st, b: this.stmt() }; }
+if (w === "foreach") { this.p++; this.needOp("("); this.declType(); const n = this.tk.v; this.p++; if (!this.isId("in")) this.err("expected 'in'"); this.p++; const e = this.expr(); this.needOp(")"); return { k: "foreach", n, e, b: this.stmt() }; }
+if (w === "return") { this.p++; let e = null; if (!this.isOp(";") && this.tk.t !== "eof" && !this.isOp("}") && this.tk.line === this.toks[this.p - 1].line) e = this.expr(); this.endStmt(); return { k: "ret", e }; }
+if (w === "break") { this.p++; this.endStmt(); return { k: "brk" }; }
+if (w === "continue") { this.p++; this.endStmt(); return { k: "cont" }; }
+if (w === "using" || w === "namespace") { while (this.tk.t !== "eof" && !this.isOp(";") && !this.isOp("{")) this.p++; if (this.isOp("{")) return this.block(); this.p++; return { k: "block", b: [] }; }
+if (CS_CMD.has(w) && !this.isOp("(", 1) && !this.isOp(".", 1) && !this.isOp("=", 1)) return this.command();
+if (w === "print" && !this.isOp("(", 1) && !this.isOp("=", 1)) { this.p++; const e = this.expr(); this.endStmt(); return { k: "expr", e: { k: "call", f: { k: "id", n: "print" }, a: [e] } }; }
+if (this.looksLikeDecl()) { const d = this.decl(); this.endStmt(); return d; }
+}
+const e = this.expr(); this.endStmt(); return { k: "expr", e };
+}
+command() {
+const name = this.tk.v, line = this.tk.line; this.p++;
+if (name === "hooks" || name === "release" || name === "help") { this.endStmt(); return { k: "cmd", name }; }
+if (name === "hold") { const e = this.expr(); this.endStmt(); return { k: "cmd", name, e }; }
+if (name === "unhook") { if (this.isId("all")) { this.p++; this.endStmt(); return { k: "cmd", name, all: true }; } const target = this.target(); this.endStmt(); return { k: "cmd", name, target }; }
+// hook / patch: Class.Method(n) => rest of the line
+const target = this.target();
+let body = null, nop = false;
+if (name === "patch" && this.isId("nop")) { this.p++; nop = true; }
+else { this.needOp("=>"); const st = this.tk.pos; let en = st; while (this.tk.t !== "eof" && this.tk.line === line && !this.isOp(";")) { en = this.tk.end; this.p++; } body = this.src.slice(st, en); if (name === "patch") { const sub = new CsParser(body); body = { ast: sub.expr() }; } }
+this.endStmt();
+return { k: "cmd", name, target, body, nop };
+}
+target() { const names = [this.tk.v]; if (this.tk.t !== "id") this.err("expected a Class.Method"); this.p++; while (this.isOp(".") && this.isId(undefined, 1)) { names.push(this.peek(1).v); this.p += 2; } let argc = -1; if (this.isOp("(") && this.peek(1).t === "num") { argc = this.peek(1).v; this.p += 3; } else if (this.isOp("(") && this.isOp(")", 1)) { argc = 0; this.p += 2; } return { names, argc }; }
+expr() { return this.assign(); }
+assign() {
+const l = this.cond();
+if (this.tk.t === "op" && ["=", "+=", "-=", "*=", "/=", "%="].indexOf(this.tk.v) >= 0 && !this.isOp("=>")) { const op = this.tk.v; this.p++; return { k: "asg", op, l, r: this.assign() }; }
+return l;
+}
+cond() { const c = this.coalesce(); if (this.eatOp("?")) { const a = this.assign(); this.needOp(":"); return { k: "cond", c, a, b: this.assign() }; } return c; }
+coalesce() { let l = this.or(); while (this.eatOp("??")) l = { k: "bin", op: "??", l, r: this.or() }; return l; }
+bin(next, ops) { let l = next.call(this); while (this.tk.t === "op" && ops.indexOf(this.tk.v) >= 0) { const op = this.tk.v; this.p++; l = { k: "bin", op, l, r: next.call(this) }; } return l; }
+or() { return this.bin(this.and, ["||"]); }
+and() { return this.bin(this.eq, ["&&"]); }
+eq() { return this.bin(this.rel, ["==", "!="]); }
+rel() { return this.bin(this.add, ["<", ">", "<=", ">="]); }
+add() { return this.bin(this.mul, ["+", "-"]); }
+mul() { return this.bin(this.unary, ["*", "/", "%"]); }
+unary() {
+const t = this.tk;
+if (t.t === "op") {
+if (t.v === "!" || t.v === "-" || t.v === "+") { this.p++; return { k: "un", op: t.v, e: this.unary() }; }
+if (t.v === "++" || t.v === "--") { this.p++; return { k: "asg", op: t.v === "++" ? "+=" : "-=", l: this.unary(), r: { k: "num", v: 1 } }; }
+if (t.v === "(" && this.peek(1).t === "id" && CS_PRIM.has(this.peek(1).v) && this.isOp(")", 2)) { const ty = this.peek(1).v; this.p += 3; return { k: "cast", ty, e: this.unary() }; }
+}
+return this.postfix();
+}
+postfix() {
+let e = this.primary();
+for (;;) {
+if (this.isOp(".") || this.isOp("?.")) { this.p++; const t = this.tk; if (t.t !== "id") this.err("expected a name after '.'"); this.p++; let ga = null; if (this.isOp("<") && this.genericCall()) ga = this.genericArgs(); e = { k: "mem", o: e, n: t.v, ga }; }
+else if (this.isOp("(")) { this.p++; const a = []; if (!this.isOp(")")) { do { a.push(this.expr()); } while (this.eatOp(",")); } this.needOp(")"); e = { k: "call", f: e, a }; }
+else if (this.isOp("[")) { this.p++; const i = this.expr(); this.needOp("]"); e = { k: "idx", o: e, i }; }
+else if ((this.isOp("++") || this.isOp("--")) ) { const op = this.tk.v; this.p++; e = { k: "post", op, e }; }
+else break;
+}
+return e;
+}
+genericCall() { let o = 0, d = 0; for (;;) { const t = this.peek(o); if (t.t === "eof") return false; if (t.t === "op" && t.v === "<") d++; else if (t.t === "op" && t.v === ">") { d--; if (!d) return this.isOp("(", o + 1); } else if (!(t.t === "id" || (t.t === "op" && (t.v === "," || t.v === ".")))) return false; o++; } }
+genericArgs() { const names = []; let d = 0; do { const t = this.tk; if (t.t === "op" && t.v === "<") d++; else if (t.t === "op" && t.v === ">") d--; else if (t.t === "id") names.push(t.v); this.p++; } while (d > 0); return names; }
+primary() {
+const t = this.tk;
+if (t.t === "num") { this.p++; return { k: "num", v: t.v }; }
+if (t.t === "str") { this.p++; return { k: "str", v: t.v, interp: !!t.interp }; }
+if (t.t === "id") {
+if (t.v === "true" || t.v === "false") { this.p++; return { k: "bool", v: t.v === "true" }; }
+if (t.v === "null") { this.p++; return { k: "null" }; }
+if (t.v === "new") { this.p++; const names = []; if (this.tk.t !== "id") this.err("expected a type after new"); names.push(this.tk.v); this.p++; while (this.isOp(".") && this.isId(undefined, 1)) { names.push(this.peek(1).v); this.p += 2; } const a = []; if (this.eatOp("(")) { if (!this.isOp(")")) { do { a.push(this.expr()); } while (this.eatOp(",")); } this.needOp(")"); } else if (this.isOp("[")) this.err("new arrays are not supported"); return { k: "new", names, a }; }
+if (t.v === "typeof" && this.isOp("(", 1)) { this.p += 2; const names = [this.tk.v]; this.p++; while (this.isOp(".") && this.isId(undefined, 1)) { names.push(this.peek(1).v); this.p += 2; } this.needOp(")"); return { k: "typeof", names }; }
+this.p++; return { k: "id", n: t.v };
+}
+if (t.t === "op" && t.v === "(") { this.p++; const e = this.expr(); this.needOp(")"); return e; }
+this.err("unexpected '" + (t.v || "end of code") + "'");
+}
+}
+
+// ---------- interpreter ----------
+const csGlobals = new Map();
+class Scope { constructor(parent) { this.vars = new Map(); this.parent = parent || null; } find(n) { for (let s = this; s; s = s.parent) if (s.vars.has(n)) return s; return null; } }
+const isNil = (v) => v === null || v === undefined || (v instanceof Ptr && !v.v);
+const csArg = (v) => (v instanceof Ptr ? v.v : v);
+const csPtrOrVal = (v, retType) => ((retType && RT.isPtrType(retType) && retType !== "System.String" && typeof v === "number") ? (v ? new Ptr(v) : null) : v);
+function csFmt(v) {
+if (v === undefined) return "ok";
+if (v === null) return "null";
+if (v instanceof Ptr) { if (!v.v) return "null"; const i = RT.inspect(v.v); return hex(v.v) + (i ? "  (" + i.name + ")" : ""); }
+if (v && v.cls) return "class " + v.cls;
+if (Array.isArray(v)) return "(" + v.map((x) => (typeof x === "number" ? Math.round(x * 1000) / 1000 : csFmt(x))).join(", ") + ")";
+if (typeof v === "number") return Number.isInteger(v) ? String(v) : String(Math.round(v * 10000) / 10000);
+if (typeof v === "string") return JSON.stringify(v);
+return String(v);
+}
+const csShortIdx = { n: -1, map: new Map() };
+function csShort() {
+const m = RT.meta; if (csShortIdx.n === m.T.length) return csShortIdx.map;
+const sh = new Map();
+for (let i = 0; i < m.T.length; i++) { const full = m.name(i); const last = full.slice(full.lastIndexOf(".") + 1).replace(/`\d+$/, ""); if (!last || /[<>]/.test(last)) continue; let l = sh.get(last); if (!l) sh.set(last, l = []); if (l.indexOf(full) < 0) l.push(full); }
+csShortIdx.n = m.T.length; csShortIdx.map = sh; return sh;
 }
 function csClass(name) {
 if (!RT || !RT.meta) return null;
 if (RT.cls(name)) return name;
 if (RT.cls(name + "`1")) return name + "`1";
 const l = csShort().get(name.slice(name.lastIndexOf(".") + 1)); if (!l) return null;
-const m = RT.meta, cand = l.filter((f) => !name.includes(".") || f.endsWith(name));
-const game = cand.filter((f) => (RT.cls(f) || []).some((ti) => ti >= m.gameStart));
+const cand = l.filter((f) => !name.includes(".") || f.endsWith(name));
+const game = cand.filter((f) => (RT.cls(f) || []).some((ti) => ti >= RT.meta.gameStart));
 return (game[0] || cand[0]) || null;
-}
-function csSplit(s, sep) {
-const out = []; let d = 0, q = false, cur = "";
-for (let i = 0; i < s.length; i++) {
-const c = s[i];
-if (q) { cur += c; if (c === "\\") { cur += s[++i] || ""; } else if (c === '"') q = false; continue; }
-if (c === '"') { q = true; cur += c; continue; }
-if ("([{".indexOf(c) >= 0) d++; else if (")]}".indexOf(c) >= 0) d--;
-if (c === sep && d === 0) { out.push(cur); cur = ""; } else cur += c;
-}
-out.push(cur); return out;
-}
-function csStatements(src) {
-const lines = src.split("\n").map((l) => { let q = false; for (let i = 0; i < l.length; i++) { if (l[i] === '"' && l[i - 1] !== "\\") q = !q; if (!q && l[i] === "/" && l[i + 1] === "/") return l.slice(0, i); } return l; });
-const out = [];
-for (const line of lines) { let d = 0, q = false, cur = ""; for (let i = 0; i < line.length; i++) { const c = line[i]; if (c === '"' && line[i - 1] !== "\\") q = !q; if (!q) { if ("([{".indexOf(c) >= 0) d++; else if (")]}".indexOf(c) >= 0) d--; if (c === ";" && d === 0) { if (cur.trim()) out.push(cur.trim()); cur = ""; continue; } } cur += c; } if (cur.trim()) out.push(cur.trim()); }
-return out;
-}
-const csVars = new Map();
-const csArg = (v) => (v instanceof Ptr ? v.v : v);
-function csPtrOrVal(v, retType) { return (retType && RT.isPtrType(retType) && retType !== "System.String" && typeof v === "number") ? new Ptr(v) : v; }
-function csFmt(v) {
-if (v === undefined) return "ok";
-if (v instanceof Ptr) { if (!v.v) return "null"; const i = RT.inspect(v.v); return hex(v.v) + (i ? "  (" + i.name + ")" : ""); }
-if (Array.isArray(v)) return "(" + v.map((x) => (typeof x === "number" ? Math.round(x * 1000) / 1000 : csFmt(x))).join(", ") + ")";
-if (typeof v === "number") return Number.isInteger(v) ? String(v) : String(Math.round(v * 10000) / 10000);
-if (typeof v === "string") return JSON.stringify(v);
-return String(v);
 }
 function csEnumMember(full, name) { const l = RT.cls(full); if (!l || !RT.meta.isEnum(l[0])) return undefined; const e = RT.enumOf(full).find((x) => x.name === name); return e ? e.value : undefined; }
 function csConv(m, args) {
-return args.map((v, i) => {
-v = csArg(v); const t = m.pars[i] && m.pars[i].type;
-if (typeof v === "string" && t) { const l = RT.cls(t); if (l && RT.meta.isEnum(l[0])) { const e = RT.enumOf(t).find((x) => x.name === v); if (e) return e.value; } }
-return v;
-});
+return args.map((v, i) => { v = csArg(v); const t = m.pars[i] && m.pars[i].type; if (typeof v === "string" && t) { const l = RT.cls(t); if (l && RT.meta.isEnum(l[0])) { const e = RT.enumOf(t).find((x) => x.name === v); if (e) return e.value; } } return v; });
 }
 function csPick(cands, args) {
 const ok = cands.filter((m) => m.pars.length === args.length); if (!ok.length) return null; if (ok.length === 1) return ok[0];
 let best = null, bs = -1;
-for (const m of ok) {
-let s = 0;
-m.pars.forEach((p, i) => { const v = csArg(args[i]), w = RT.wtype(p.type);
-if (typeof v === "number") { if (Number.isInteger(v) && w === "i") s += 2; else if (!Number.isInteger(v) && (w === "f" || w === "d")) s += 2; else if (w === "f" || w === "d" || w === "i" || w === "j") s += 1; }
-else if (typeof v === "boolean" && p.type === "System.Boolean") s += 2;
-else if (typeof v === "string" && p.type === "System.String") s += 2;
-else if (Array.isArray(v) && w === "S") s += 2; });
-if (s > bs) { bs = s; best = m; }
-}
+for (const m of ok) { let s = 0; m.pars.forEach((p, i) => { const v = csArg(args[i]), w = RT.wtype(p.type); if (typeof v === "number") { if (Number.isInteger(v) && w === "i") s += 2; else if (!Number.isInteger(v) && (w === "f" || w === "d")) s += 2; else if (w === "f" || w === "d" || w === "i" || w === "j") s += 1; } else if (typeof v === "boolean" && p.type === "System.Boolean") s += 2; else if (typeof v === "string" && p.type === "System.String") s += 2; else if (Array.isArray(v) && w === "S") s += 2; }); if (s > bs) { bs = s; best = m; } }
 return best;
 }
 function csCall(cands, thisPtr, args, what) {
 const m = csPick(cands, args); if (!m) throw new Error("no " + what + " taking " + args.length + " argument(s)");
-const r = RT.invokeF(m, m.static ? 0 : thisPtr, csConv(m, args));
-return csPtrOrVal(r, m.ret);
+return csPtrOrVal(RT.invokeF(m, m.static ? 0 : thisPtr, csConv(m, args)), m.ret);
 }
 function csFieldVal(obj, f) {
 const v = RT.read(obj, f);
-if (f.kind === "string") { const s = RT.readStr(v); return s === null ? new Ptr(v) : s; }
-if (["object", "array", "generic", "T", "ptr"].indexOf(f.kind) >= 0) return new Ptr(v);
+if (f.kind === "string") { const s = RT.readStr(v); return s === null ? (v ? new Ptr(v) : null) : s; }
+if (["object", "array", "generic", "T", "ptr"].indexOf(f.kind) >= 0) return v ? new Ptr(v) : null;
 return v;
 }
 function csSetField(obj, f, v) {
 v = csArg(v);
 if (typeof v === "string") { if (f.kind === "string") v = RT.newString(v); else if (f.enumTi >= 0) { const e = RT.meta.enumMembers(f.enumTi).find((x) => x.name === v); if (!e) throw new Error("no enum value " + v); v = e.value; } else throw new Error("cannot store a string in " + f.tn); }
+if (v === null) v = 0;
 RT.write(obj, f, v);
 }
-// evaluate a dotted path: head, then members
-function csSegs(s) {
-return csSplit(s, ".").map((t) => { t = t.trim(); const i = t.indexOf("("); if (i < 0) return { name: t, args: null }; if (!t.endsWith(")")) throw new Error("bad call syntax: " + t); const inner = t.slice(i + 1, -1).trim(); return { name: t.slice(0, i).trim(), args: inner ? csSplit(inner, ",").map((a) => csEval(a)) : [] }; });
+const VEC = { x: 0, y: 1, z: 2, w: 3, r: 0, g: 1, b: 2, a: 3 };
+function arrElem(p, i) {
+const a = RT.arrayInfo(p); if (!a) throw new Error("not an array");
+if (i < 0 || i >= a.total) throw new Error("index " + i + " is outside the array (" + a.total + ")");
+const dv = new DataView(RT.M.HEAPU8.buffer), ea = a.base + i * a.sz;
+if (a.el === "Single") return dv.getFloat32(ea, true);
+if (["Int32", "UInt32", "Int16", "Byte", "Boolean", "Double", "Int64"].indexOf(a.el) >= 0) return a.sz === 4 ? dv.getInt32(ea, true) : a.sz === 1 ? dv.getUint8(ea) : a.sz === 2 ? dv.getInt16(ea, true) : dv.getFloat64(ea, true);
+const r = dv.getUint32(ea, true); return r ? new Ptr(r) : null;
 }
-function csHead(segs) {
-const first = segs[0];
-if (first.args === null && csVars.has(first.name)) return { cur: csVars.get(first.name), i: 1 };
-for (let n = segs.length; n >= 1; n--) {
-if (segs.slice(0, n).some((x) => x.args !== null && x !== segs[n - 1])) continue;
-if (segs[n - 1].args !== null) continue;
-const full = csClass(segs.slice(0, n).map((x) => x.name).join("."));
-if (full) return { cur: { cls: full }, i: n };
+function listItems(p) { const items = RT.listItems(p); return items.map((x) => (x ? new Ptr(x) : null)); }
+function toIter(v) {
+if (Array.isArray(v)) return v;
+if (v instanceof Ptr && v.v) { const k = RT.rw(v.v), nm = RT.klassName(k); if (nm.slice(-2) === "[]") { const a = RT.arrayInfo(v.v), out = []; for (let i = 0; i < Math.min(a.total, 2000); i++) out.push(arrElem(v.v, i)); return out; } if (RT.fieldOf(v.v, "_items")) return listItems(v.v); }
+throw new Error("cannot loop over " + csFmt(v));
 }
-throw new Error("unknown name " + first.name);
+function getComponent(o, T) {
+const full = csClass(T); if (!full) throw new Error("unknown class " + T);
+const gm = RT.methodsChain(RT.rw(csArg(o))).find((m) => m.name === "get_gameObject" && !m.pars.length);
+const go = RT.klassName(RT.rw(csArg(o))) === "GameObject" ? csArg(o) : (gm ? RT.invoke(gm, csArg(o), []) >>> 0 : 0);
+for (const c of RT.liveAll(full)) { const g = RT.methodsChain(RT.rw(c)).find((m) => m.name === "get_gameObject" && !m.pars.length); if (g && RT.invoke(g, c, []) >>> 0 === go) return new Ptr(c); }
+return null;
 }
-function csMember(cur, seg, setVal, hasSet) {
-if (cur && cur.cls) { // static context
-const full = cur.cls;
-if (seg.args === null) { const ev = csEnumMember(full, seg.name); if (ev !== undefined) return ev; }
-const k = RT.klassByName(full);
-if (!k) throw new Error(full + " is not indexed yet");
-if (seg.args === null) {
-const f = RT.klassFields(k).find((x) => x.name === seg.name && x.isStatic);
+function csMemberGet(o, name, sc, node) {
+if (o && o.ns) { const full = csClass(o.ns + "." + name); return full ? { cls: full } : { ns: o.ns + "." + name }; }
+if (isNil(o)) throw new Error("null reference: cannot read ." + name);
+if (o.cls) return staticMember(o.cls, name, undefined, false);
+if (Array.isArray(o)) { if (name in VEC) return o[VEC[name]]; if (name === "Length" || name === "Count") return o.length; throw new Error("no member " + name + " on a list/vector"); }
+if (typeof o === "string") { if (name === "Length") return o.length; throw new Error("no member " + name + " on a string"); }
+if (o instanceof Ptr) {
+const k = RT.rw(o.v), kn = RT.klassName(k);
+if (kn.slice(-2) === "[]" && (name === "Length" || name === "Count")) return RT.rw(o.v + 12);
+const f = RT.fieldOf(o.v, name);
+if (f) return csFieldVal(o.v, f);
+if (name === "Count" && RT.fieldOf(o.v, "_size")) return RT.read(o.v, RT.fieldOf(o.v, "_size"));
+const chain = RT.methodsChain(k), c = chain.filter((m) => m.name === "get_" + name && !m.pars.length);
+if (c.length) return csCall(c, o.v, [], name);
+throw new Error("no field or property '" + name + "' on " + kn);
+}
+throw new Error("cannot read ." + name + " of " + csFmt(o));
+}
+function staticMember(full, name, setVal, hasSet) {
+if (!hasSet) { const ev = csEnumMember(full, name); if (ev !== undefined) return ev; }
+const k = RT.klassByName(full); if (!k) throw new Error(full + " is not indexed yet");
+const f = RT.klassFields(k).find((x) => x.name === name && x.isStatic);
 if (f) { if (hasSet) { csSetField(0, f, setVal); return setVal; } return csFieldVal(0, f); }
+const chain = RT.methodsChain(k), mn = hasSet ? "set_" + name : "get_" + name, args = hasSet ? [setVal] : [];
+let c = chain.filter((m) => m.name === mn && m.static);
+if (c.length) { const r = csCall(c, 0, args, full + "." + mn); return hasSet ? setVal : r; }
+c = chain.filter((m) => m.name === mn && !m.static);
+if (c.length) { const o = RT.singleton(full); if (!o) throw new Error("no live " + full + " object for " + mn); const r = csCall(c, o, args, full + "." + mn); return hasSet ? setVal : r; }
+throw new Error("no member " + full + "." + name);
 }
+function csMemberSet(o, name, val) {
+if (isNil(o)) throw new Error("null reference: cannot set ." + name);
+if (o.cls) { staticMember(o.cls, name, val, true); return; }
+if (Array.isArray(o)) { if (name in VEC) { o[VEC[name]] = csArg(val); return; } throw new Error("cannot set ." + name); }
+if (o instanceof Ptr) {
+const f = RT.fieldOf(o.v, name);
+if (f) { csSetField(o.v, f, val); return; }
+const c = RT.methodsChain(RT.rw(o.v)).filter((m) => m.name === "set_" + name);
+if (!c.length) throw new Error("no field or property '" + name + "' to set on " + RT.klassName(RT.rw(o.v)));
+csCall(c, o.v, [val], "set_" + name); return;
+}
+throw new Error("cannot set ." + name + " on " + csFmt(o));
+}
+function csCallMember(o, name, args, ga, out) {
+if (o && o.ns) { if (/^(Debug|Console|UnityEngine\.Debug|System\.Console)$/.test(o.ns) && /^(Log|LogWarning|LogError|WriteLine|Write)$/.test(name)) { out(args.map(csFmtPlain).join(" ")); return undefined; } throw new Error("unknown name " + o.ns); }
+if (isNil(o)) throw new Error("null reference: cannot call ." + name + "()");
+if (o.cls) {
+const full = o.cls, short = full.slice(full.lastIndexOf(".") + 1);
+if (short === "Debug" || short === "Console") { if (/^(Log|LogWarning|LogError|WriteLine|Write)$/.test(name)) { out(args.map(csFmtPlain).join(" ")); return undefined; } }
+const k = RT.klassByName(full); if (!k) throw new Error(full + " is not indexed yet");
 const chain = RT.methodsChain(k);
-const name = seg.args === null ? (hasSet ? "set_" + seg.name : "get_" + seg.name) : seg.name, args = seg.args === null ? (hasSet ? [setVal] : []) : seg.args;
-let cands = chain.filter((m) => m.name === name && m.static);
-if (cands.length && csPick(cands, args)) { const r = csCall(cands, 0, args, full + "." + name); return hasSet ? setVal : r; }
-cands = chain.filter((m) => m.name === name && !m.static);
-if (cands.length) { const o = RT.findAll(full)[0]; if (!o) throw new Error("no live " + full + " object for the instance method " + name); const r = csCall(cands, o, args, full + "." + name); return hasSet ? setVal : r; }
-throw new Error("no member " + full + "." + seg.name);
+let c = chain.filter((m) => m.name === name && m.static);
+if (c.length && csPick(c, args)) return csCall(c, 0, args, full + "." + name);
+c = chain.filter((m) => m.name === name && !m.static);
+if (c.length) { const inst = RT.singleton(full); if (!inst) throw new Error("no live " + full + " object to call " + name + " on"); return csCall(c, inst, args, full + "." + name); }
+throw new Error("no method " + full + "." + name + " taking " + args.length + " argument(s)");
 }
-const obj = csArg(cur);
-if (typeof obj !== "number" || !obj) throw new Error("null reference before ." + seg.name);
-const k = RT.rw(obj);
-if (seg.args === null) {
-const f = RT.fieldOf(obj, seg.name);
-if (f) { if (hasSet) { csSetField(obj, f, setVal); return setVal; } return csFieldVal(obj, f); }
+if (typeof o === "string") { if (name === "ToString") return o; if (name === "Contains") return o.indexOf(args[0]) >= 0; if (name === "ToLower") return o.toLowerCase(); if (name === "ToUpper") return o.toUpperCase(); throw new Error("string has no " + name); }
+if (Array.isArray(o)) { if (name === "ToString") return csFmt(o); throw new Error("vector/list has no method " + name); }
+if (o instanceof Ptr) {
+if (name === "GetComponent" && ga) return getComponent(o, ga[0]);
+if (name === "ToString" && !args.length) { const i = RT.inspect(o.v); return i ? i.name : "object"; }
+const c = RT.methodsChain(RT.rw(o.v)).filter((m) => m.name === name);
+if (!c.length) throw new Error("no method " + name + " on " + RT.klassName(RT.rw(o.v)));
+return csCall(c, o.v, args, name);
 }
-const chain = RT.methodsChain(k);
-const name = seg.args === null ? (hasSet ? "set_" + seg.name : "get_" + seg.name) : seg.name, args = seg.args === null ? (hasSet ? [setVal] : []) : seg.args;
-const cands = chain.filter((m) => m.name === name);
-if (!cands.length) throw new Error("no member " + seg.name + " on " + RT.klassName(k));
-const r = csCall(cands, obj, args, name); return hasSet ? setVal : r;
+throw new Error("cannot call ." + name + " on " + csFmt(o));
 }
-function csPath(s, setVal, hasSet) {
-const segs = csSegs(s); const h = csHead(segs); let cur = h.cur;
-for (let i = h.i; i < segs.length; i++) cur = csMember(cur, segs[i], setVal, hasSet && i === segs.length - 1);
-if (segs.length === h.i && hasSet) throw new Error("cannot assign to a class or variable here");
-return cur && cur.cls ? "class " + cur.cls : cur;
-}
+const csFmtPlain = (v) => (typeof v === "string" ? v : csFmt(v));
 const CSB = {
-find: (a) => { const c = csClass(String(csArg(a[0]))); if (!c) throw new Error("unknown class " + a[0]); const o = RT.findAll(c)[0]; return new Ptr(o || 0); },
-findAll: (a) => { const c = csClass(String(csArg(a[0]))); if (!c) throw new Error("unknown class " + a[0]); return RT.findAll(c).map((o) => new Ptr(o)); },
+find: (a) => { const x = csArg(a[0]); if (typeof x !== "string") return a[0]; const c = csClass(x); if (c) { const o = RT.singleton(c); if (o) return new Ptr(o); } const h = findByName(x)[0]; return h ? new Ptr(h.ptr) : null; },
+findAll: (a) => { const x = String(csArg(a[0])); const c = csClass(x); if (c) { const l = RT.liveAll(c); if (l.length) return l.map((o) => new Ptr(o)); } return findByName(x).map((h) => new Ptr(h.ptr)); },
+findByName: (a) => { const h = findByName(String(csArg(a[0])))[0]; return h ? new Ptr(h.ptr) : null; },
 peek: (a) => RT.M.HEAPU32[csArg(a[0]) >>> 2], peekf: (a) => RT.M.HEAPF32[csArg(a[0]) >>> 2],
 poke: (a) => { RT.M.HEAPU32[csArg(a[0]) >>> 2] = csArg(a[1]) >>> 0; }, pokef: (a) => { RT.M.HEAPF32[csArg(a[0]) >>> 2] = +csArg(a[1]); },
 str: (a) => { const s = RT.readStr(csArg(a[0]) >>> 0); return s === null ? "(not a string)" : s; },
-"typeof": (a) => { const i = RT.inspect(csArg(a[0]) >>> 0); return i ? i.parents.join(" < ") : "(not an object)"; },
-Vector3: (a) => a.map(csArg), Vector2: (a) => a.map(csArg), Quaternion: (a) => a.map(csArg), Color: (a) => a.map(csArg), Vector4: (a) => a.map(csArg)
+inRun: () => inRun(), name: (a) => unityName(csArg(a[0])),
+typeName: (a) => { const i = RT.inspect(csArg(a[0]) >>> 0); return i ? i.parents.join(" < ") : "(not an object)"; },
+Vector3: (a) => a.map(csArg), Vector2: (a) => a.map(csArg), Vector4: (a) => a.map(csArg), Quaternion: (a) => a.map(csArg), Color: (a) => a.map(csArg)
 };
-function csEval(s) {
-s = s.trim();
-if (!s) throw new Error("empty expression");
-if (/^"(?:[^"\\]|\\.)*"$/.test(s)) return JSON.parse(s);
-if (/^-?\d+(\.\d+)?[fFdD]?$/.test(s)) return parseFloat(s);
-if (/^-?0x[0-9a-fA-F]+$/.test(s)) return parseInt(s, 16);
-if (s === "true") return true; if (s === "false") return false; if (s === "null") return new Ptr(0);
-if (s[0] === "[" && s.endsWith("]")) return csSplit(s.slice(1, -1), ",").map((x) => csEval(x));
-if (/^new\s+\w+\s*\(/.test(s)) s = s.replace(/^new\s+/, "");
-const bi = /^(\w+)\s*\((.*)\)$/s.exec(s);
-if (bi && (bi[1] === "find" || bi[1] === "findAll") && !csVars.has(bi[1])) return CSB[bi[1]]([bi[2].trim().replace(/^"|"$/g, "")]);
-if (bi && CSB[bi[1]] && !csVars.has(bi[1])) { const inner = bi[2].trim(); return CSB[bi[1]](inner ? csSplit(inner, ",").map((x) => csEval(x)) : []); }
-if (/^[\d\s+\-*/().]+$/.test(s)) return Function("return (" + s + ")")();
-if (/^[A-Za-z_]\w*$/.test(s) && csVars.has(s)) return csVars.get(s);
-return csPath(s);
+function interp(sc, str, out) { return str.replace(/\{([^{}]+)\}/g, (m0, ex) => { try { return csFmtPlain(csEval(new CsParser(ex).expr(), sc, out)); } catch (e) { return "{" + ex + "}"; } }); }
+function arith(op, a, b) {
+if (Array.isArray(a) && Array.isArray(b)) { if (op === "+") return a.map((x, i) => x + b[i]); if (op === "-") return a.map((x, i) => x - b[i]); }
+if (Array.isArray(a) && typeof b === "number") { if (op === "*") return a.map((x) => x * b); if (op === "/") return a.map((x) => x / b); }
+if (typeof a === "number" && Array.isArray(b) && op === "*") return b.map((x) => x * a);
+a = csArg(a); b = csArg(b);
+switch (op) { case "+": return a + b; case "-": return a - b; case "*": return a * b; case "/": return a / b; case "%": return a % b; }
 }
-function csTarget(s) { // "Class.Method" or "Class.Method(2)" -> found method info
-const m = /^(.*?)(?:\((\d*)\))?$/.exec(s.trim()); const segs = m[1].split(".").map((x) => x.trim()); const name = segs.pop(); const cls = csClass(segs.join("."));
-if (!cls) throw new Error("unknown class " + segs.join("."));
+function csTruthy(v) { return v instanceof Ptr ? !!v.v : !!v; }
+function csEq(a, b) { if (isNil(a) || isNil(b)) return isNil(a) && isNil(b); return csArg(a) === csArg(b); }
+function use(v, what) { if (v && v.ns) throw new Error("unknown name " + v.ns.split(".")[0] + " (not a variable, class or helper)"); return v; }
+function csEval(n, sc, out) {
+switch (n.k) {
+case "num": case "bool": return n.v;
+case "null": return null;
+case "str": return n.interp ? interp(sc, n.v, out) : n.v;
+case "id": {
+const s = sc.find(n.n); if (s) return s.vars.get(n.n);
+const c = csClass(n.n); if (c) return { cls: c };
+return { ns: n.n };
+}
+case "mem": { const o = csEval(n.o, sc, out); return csMemberGet(o, n.n, sc, n); }
+case "idx": {
+const o = use(csEval(n.o, sc, out)), i = csArg(csEval(n.i, sc, out));
+if (Array.isArray(o)) return o[i];
+if (typeof o === "string") return o[i];
+if (o instanceof Ptr && o.v) { const kn = RT.klassName(RT.rw(o.v)); if (kn.slice(-2) === "[]") return arrElem(o.v, i); if (RT.fieldOf(o.v, "_items")) return listItems(o.v)[i]; }
+throw new Error("cannot index " + csFmt(o));
+}
+case "call": {
+const args = n.a.map((x) => use(csEval(x, sc, out)));
+const f = n.f;
+if (f.k === "id") {
+const s = sc.find(f.n); if (s) throw new Error(f.n + " is a variable, not a method");
+if (CSB[f.n]) return CSB[f.n](args);
+if (f.n === "print" || f.n === "Print") { out(args.map(csFmtPlain).join(" ")); return undefined; }
+throw new Error("unknown method " + f.n + "()");
+}
+if (f.k === "mem") { const o = csEval(f.o, sc, out); return csCallMember(o, f.n, args, f.ga, out); }
+throw new Error("cannot call this expression");
+}
+case "new": {
+const nm = n.names[n.names.length - 1], args = n.a.map((x) => csArg(csEval(x, sc, out)));
+if (CSB[nm] && /^(Vector[234]|Quaternion|Color)$/.test(nm)) return CSB[nm](args);
+throw new Error("cannot create " + nm + " from outside the game (use find(...) to get a live one)");
+}
+case "typeof": { const c = csClass(n.names.join(".")); if (!c) throw new Error("unknown class " + n.names.join(".")); return { cls: c }; }
+case "un": { const v = use(csEval(n.e, sc, out)); if (n.op === "!") return !csTruthy(v); if (n.op === "-") return Array.isArray(v) ? v.map((x) => -x) : -csArg(v); return csArg(v); }
+case "cast": { const v = csArg(use(csEval(n.e, sc, out))); if (n.ty === "int" || n.ty === "long" || n.ty === "short" || n.ty === "byte" || n.ty === "uint") return Math.trunc(v); if (n.ty === "float" || n.ty === "double") return +v; if (n.ty === "string") return String(v); if (n.ty === "bool") return !!v; return v; }
+case "cond": return csTruthy(use(csEval(n.c, sc, out))) ? csEval(n.a, sc, out) : csEval(n.b, sc, out);
+case "bin": {
+if (n.op === "&&") { const l = use(csEval(n.l, sc, out)); return csTruthy(l) ? csTruthy(use(csEval(n.r, sc, out))) : false; }
+if (n.op === "||") { const l = use(csEval(n.l, sc, out)); return csTruthy(l) ? true : csTruthy(use(csEval(n.r, sc, out))); }
+if (n.op === "??") { const l = csEval(n.l, sc, out); return isNil(l) ? csEval(n.r, sc, out) : l; }
+const a = use(csEval(n.l, sc, out)), b = use(csEval(n.r, sc, out));
+switch (n.op) {
+case "==": return csEq(a, b); case "!=": return !csEq(a, b);
+case "<": return csArg(a) < csArg(b); case ">": return csArg(a) > csArg(b); case "<=": return csArg(a) <= csArg(b); case ">=": return csArg(a) >= csArg(b);
+case "+": if (typeof a === "string" || typeof b === "string") return csFmtPlain(a) + csFmtPlain(b); return arith("+", a, b);
+default: return arith(n.op, a, b);
+}
+}
+case "post": { const old = csEval(n.e, sc, out); csAssign(n.e, arith(n.op === "++" ? "+" : "-", old, 1), sc, out); return old; }
+case "asg": {
+let v = use(csEval(n.r, sc, out));
+if (n.op !== "=") { const cur = csEval(n.l, sc, out); v = n.op === "+=" && (typeof cur === "string") ? cur + csFmtPlain(v) : arith(n.op[0], cur, v); }
+csAssign(n.l, v, sc, out); return v;
+}
+}
+throw new Error("unsupported expression " + n.k);
+}
+function csAssign(t, v, sc, out) {
+if (t.k === "id") { const s = sc.find(t.n); (s || csRoot).vars.set(t.n, v); return; }
+if (t.k === "mem") { csMemberSet(use(csEval(t.o, sc, out)), t.n, v); return; }
+if (t.k === "idx") { const o = use(csEval(t.o, sc, out)), i = csArg(csEval(t.i, sc, out)); if (Array.isArray(o)) { o[i] = v; return; } throw new Error("cannot assign into this array from outside the game"); }
+throw new Error("cannot assign to this expression");
+}
+const csRoot = new Scope(); csRoot.vars = csGlobals;
+const SIG_BREAK = { s: "break" }, SIG_CONT = { s: "continue" };
+function csTarget(t) {
+const joined = t.names.slice(0, -1).join("."), name = t.names[t.names.length - 1], cls = csClass(joined);
+if (!cls) throw new Error("unknown class " + joined);
 const k = RT.klassByName(cls); let kk = k, g = 0; const have = new Set();
 while (kk && RT.inHeap(kk) && g++ < 14) { RT.methodsOfKlass(kk).forEach((x) => { if (x.name === name) have.add(x.pars.length); }); kk = RT.L.parent ? RT.rw(kk + RT.L.parent) : 0; }
 if (!have.size) throw new Error("no method " + cls + "." + name);
-let argc = m[2] !== undefined && m[2] !== "" ? +m[2] : (have.size === 1 ? Array.from(have)[0] : -1);
+const argc = t.argc >= 0 ? t.argc : (have.size === 1 ? Array.from(have)[0] : -1);
 if (argc < 0) throw new Error(name + " has overloads with " + Array.from(have).join("/") + " arguments, write " + name + "(n)");
 return { f: findChain(cls, name, argc), label: cls.split(".").pop() + "." + name };
 }
-function csExec(st, out) {
-let m;
-if ((m = /^using\s+/.exec(st))) return undefined;
-if (st === "help") return "Class.Method(args) | var o = find(Class) | o.field = v | foreach (var o in Class) stmt | hold o.f = v | release | hook C.M(n) => expr | patch C.M => value|nop | unhook C.M|all | hooks | peek/poke/str/typeof";
-if (st === "release") { ovRelease("code"); return "released"; }
-if (st === "hooks") { const l = HOOKS.list(); return l.length ? l.map((r) => r.label + "  " + r.hits + " hits" + (r.err ? "  ERR " + r.err : "")).join("\n") : "no hooks"; }
-if ((m = /^unhook\s+(.+)$/.exec(st))) { if (m[1].trim() === "all") { HOOKS.off(); return "all hooks removed"; } const t = csTarget(m[1]); const r = HOOKS.list().find((x) => x.fn === t.f.m.fn); if (!r) return "not hooked"; HOOKS.off(r); return "unhooked " + t.label; }
-if ((m = /^patch\s+(.+?)\s*(=>|\s)\s*(nop|.+)$/s.exec(st))) {
-const t = csTarget(m[1]); let rec;
-if (m[3].trim() === "nop") rec = hookFound(t.f, () => 0, t.label + " (nop)");
-else { const v = csArg(csEval(m[3])); rec = hookFound(t.f, () => v, t.label + " => " + csFmt(v)); }
-return "patched " + t.label + " (sig " + rec.sig + "), watch the hit counter with: hooks";
+function csCommand(n, sc, out) {
+switch (n.name) {
+case "help": return "Real C# subset: var x = find(\"Jake\"); x.transform.localScale = new Vector3(2,2,2); if/while/for/foreach; Class.Method(args); hold o.f = v; release; hook C.M(n) => expr; patch C.M => value|nop; unhook C.M|all; hooks. Press To Frida JS to translate.";
+case "release": ovRelease("code"); return "released";
+case "hooks": { const l = HOOKS.list(); return l.length ? l.map((r) => r.label + "  " + r.hits + " hits" + (r.err ? "  ERR " + r.err : "")).join("\n") : "no hooks"; }
+case "unhook": { if (n.all) { HOOKS.off(); return "all hooks removed"; } const t = csTarget(n.target); const r = HOOKS.list().find((x) => x.fn === t.f.m.fn); if (!r) return "not hooked"; HOOKS.off(r); return "unhooked " + t.label; }
+case "hold": { const a = n.e; if (a.k !== "asg" || a.l.k !== "mem") throw new Error("hold needs obj.field = value"); const o = csArg(use(csEval(a.l.o, sc, out))), f = RT.fieldOf(o, a.l.n); if (!f) throw new Error("no field " + a.l.n); ovSet("code", o, f, csArg(csEval(a.r, sc, out))); return "holding " + a.l.n; }
+case "patch": case "hook": {
+const t = csTarget(n.target); let rec;
+if (n.name === "patch") {
+if (n.nop) rec = hookFound(t.f, () => 0, t.label + " (nop)");
+else { const v = csArg(csEval(n.body.ast, sc, out)); rec = hookFound(t.f, () => v, t.label + " => " + csFmt(v)); }
+} else { const fn = new Function("orig", "args", "return (" + n.body + ");"); rec = hookFound(t.f, (a, orig) => fn(function () { return orig.apply(null, a); }, a.slice(0, -1)), t.label); }
+return (n.name === "patch" ? "patched " : "hooked ") + t.label + " (sig " + rec.sig + "), watch the hit counter with: hooks";
 }
-if ((m = /^hook\s+(.+?)\s*=>\s*(.+)$/s.exec(st))) {
-const t = csTarget(m[1]); const fn = new Function("orig", "args", "return (" + m[2] + ");");
-const rec = hookFound(t.f, (a, orig) => fn(function () { return orig.apply(null, a); }, a.slice(0, -1)), t.label);
-return "hooked " + t.label + " (sig " + rec.sig + "), watch the hit counter with: hooks";
 }
-if ((m = /^hold\s+(.+?)\s*=\s*(.+)$/s.exec(st))) {
-const lhs = m[1].trim(), i = lhs.lastIndexOf("."); if (i < 0) throw new Error("hold needs obj.field");
-const o = csArg(csEval(lhs.slice(0, i))); const f = RT.fieldOf(o, lhs.slice(i + 1)); if (!f) throw new Error("no field " + lhs.slice(i + 1));
-ovSet("code", o, f, csArg(csEval(m[2]))); return "holding " + lhs;
 }
-if ((m = /^foreach\s*\(?\s*(?:var\s+)?(\w+)\s+in\s+([\w.`]+)\s*\)?\s*(.+)$/s.exec(st))) {
-const c = csClass(m[2]); if (!c) throw new Error("unknown class " + m[2]);
-const body = m[3].trim().replace(/^\{/, "").replace(/\}$/, ""); const objs = RT.findAll(c).slice(0, 300); let n = 0;
-for (const o of objs) { csVars.set(m[1], new Ptr(o)); for (const b of csStatements(body)) csExec(b, out); n++; }
-csVars.delete(m[1]); return n + " object(s)";
+function csExec(n, sc, out, top) {
+switch (n.k) {
+case "block": { const s2 = new Scope(sc); for (const st of n.b) { const r = csExec(st, s2, out, false); if (r) return r; } return null; }
+case "var": { const v = n.e ? use(csEval(n.e, sc, out)) : null; sc.vars.set(n.n, v); return top ? { say: n.n + " = " + csFmt(v) } : null; }
+case "expr": { const v = csEval(n.e, sc, out); const pr = n.e.k === "call" && ((n.e.f.k === "id" && n.e.f.n === "print") || (n.e.f.k === "mem" && /^(Log|LogWarning|LogError|WriteLine|Write)$/.test(n.e.f.n))); if (top && !pr) out(csFmt(v)); return null; }
+case "if": { if (csTruthy(use(csEval(n.c, sc, out)))) return csExec(n.a, sc, out, false); if (n.b) return csExec(n.b, sc, out, false); return null; }
+case "while": { let g = 0; while (csTruthy(use(csEval(n.c, sc, out)))) { if (++g > 100000) throw new Error("loop ran more than 100000 times"); const r = csExec(n.b, sc, out, false); if (r === SIG_BREAK) break; if (r && r !== SIG_CONT) return r; } return null; }
+case "for": { const s2 = new Scope(sc); if (n.init) csExec(n.init, s2, out, false); let g = 0; while (!n.c || csTruthy(use(csEval(n.c, s2, out)))) { if (++g > 100000) throw new Error("loop ran more than 100000 times"); const r = csExec(n.b, s2, out, false); if (r === SIG_BREAK) break; if (r && r !== SIG_CONT) return r; if (n.st) csEval(n.st, s2, out); } return null; }
+case "foreach": { const items = toIter(use(csEval(n.e, sc, out))); for (const it of items) { const s2 = new Scope(sc); s2.vars.set(n.n, it); const r = csExec(n.b, s2, out, false); if (r === SIG_BREAK) break; if (r && r !== SIG_CONT) return r; } return null; }
+case "ret": return { ret: n.e ? csEval(n.e, sc, out) : undefined };
+case "brk": return SIG_BREAK;
+case "cont": return SIG_CONT;
+case "cmd": { const r = csCommand(n, sc, out); if (top && r !== undefined) out(r); return null; }
 }
-if ((m = /^(?:(?:var|int|float|double|bool|string|long|uint|object)\s+)?([A-Za-z_]\w*)\s*=(?![=>])\s*(.+)$/s.exec(st)) && !/^[A-Za-z_]\w*\./.test(st)) {
-const v = csEval(m[2]); csVars.set(m[1], v); return m[1] + " = " + csFmt(v);
-}
-if ((m = /^(.+?[A-Za-z_\)\]])\s*=(?![=>])\s*(.+)$/s.exec(st))) {
-const v = csEval(m[2]); csPath(m[1].trim(), v, true); return m[1].trim() + " = " + csFmt(v);
-}
-if ((m = /^print\s+(.+)$/s.exec(st))) return csFmt(csEval(m[1]));
-return csFmt(csEval(st));
+throw new Error("unsupported statement " + n.k);
 }
 function csRun(src) {
 if (!RT || !RT.ok) return "not connected yet, wait for the green dot";
-const lines = [];
-for (const st of csStatements(src)) {
-try { const r = csExec(st, (x) => lines.push(x)); lines.push(typeof r === "string" && !/^"/.test(r) ? r : r === undefined ? "ok" : String(r)); }
-catch (e) { lines.push("error in `" + st.slice(0, 48) + "`: " + (e && e.message || e)); }
+const lines = [], out = (x) => lines.push(x);
+let prog;
+try { prog = new CsParser(src).program(); } catch (e) { return "syntax error, " + (e.message || e); }
+for (const st of prog) {
+try { const r = csExec(st, csRoot, out, true); if (r && r.say) out(r.say); if (r && r.ret !== undefined) out(csFmt(r.ret)); if (r && r.ret !== undefined) break; }
+catch (e) { out("error" + (st.k === "expr" || st.k === "var" ? "" : " in " + st.k) + ": " + (e && e.message || e)); break; }
 }
 return lines.join("\n");
 }
-// JS (the old console) is still understood: anything using ss., =>, function or starting with //js
-const looksJS = (code) => /(^|\n)\s*\/\/\s*js\b|\bss\.|\bfunction\b|\bconst\s|\blet\s|=>\s*\{/.test(code) && !/^\s*(hook|patch)\s/m.test(code);
+// JavaScript (the old console) is still understood: anything using ss., function, const/let, or starting with //js
+const looksJS = (code) => /(^|\n)\s*\/\/\s*js\b|\bss\.|\bfunction\b|(^|\n)\s*(const|let)\s/.test(code) && !/(^|\n)\s*(hook|patch)\s/.test(code);
+
+// ---------- translator: the same parse tree to frida-il2cpp-bridge JavaScript ----------
+function csToFrida(src) {
+let prog;
+try { prog = new CsParser(src).program(); } catch (e) { return "// syntax error, " + (e.message || e); }
+const classes = new Map(), declared = [new Set()];
+const isDecl = (n) => declared.some((s) => s.has(n));
+const asmOf = (full) => { const l = RT && RT.ok && RT.cls(full); return l ? RT.meta.assemblyOf(l[0]) : (/^UnityEngine/.test(full) ? "UnityEngine.CoreModule" : "Assembly-CSharp"); };
+const clsVar = (full) => { const id = "C_" + full.replace(/[^A-Za-z0-9]/g, "_"); if (!classes.has(id)) classes.set(id, { asm: asmOf(full), full }); return id; };
+const chain = (n) => { if (n.k === "id") return [n.n]; if (n.k === "mem") { const l = chain(n.o); return l ? l.concat(n.n) : null; } return null; };
+const asClass = (n) => { const c = chain(n); if (!c || isDecl(c[0])) return null; for (let i = c.length; i >= 1; i--) { const full = RT && RT.ok ? csClass(c.slice(0, i).join(".")) : (i === c.length ? c.join(".") : null); if (full && i === c.length) return full; } return null; };
+const q = (s) => JSON.stringify(s);
+const E = (n) => {
+switch (n.k) {
+case "num": return String(n.v);
+case "bool": return String(n.v);
+case "null": return "null";
+case "str": return n.interp ? "S(`" + n.v.replace(/`/g, "\\`").replace(/\{([^{}]+)\}/g, "${$1}") + "`)" : "S(" + q(n.v) + ")";
+case "id": return isDecl(n.n) ? n.n : (RT && RT.ok && csClass(n.n) ? clsVar(csClass(n.n)) : n.n);
+case "typeof": return clsVar((RT && RT.ok && csClass(n.names.join("."))) || n.names.join("."));
+case "mem": { const c = asClass(n); if (c) return clsVar(c); const bc = asClass(n.o); if (bc && RT && RT.ok) { const ev = csEnumMember(bc, n.n); if (ev !== undefined) return String(ev); } if (n.n === "Length" || n.n === "Count") return "len(" + E(n.o) + ")"; return "get(" + E(n.o) + ", " + q(n.n) + ")"; }
+case "idx": return "idx(" + E(n.o) + ", " + E(n.i) + ")";
+case "call": {
+const a = n.a.map(E);
+if (n.f.k === "id") { const nm = n.f.n; if (nm === "print") return "console.log(" + a.join(", ") + ")"; if (["find", "findAll", "findByName"].indexOf(nm) >= 0) return nm + "(" + n.a.map((x) => (x.k === "str" ? q(x.v) : E(x))).join(", ") + ")"; if (/^Vector[234]$|^Quaternion$|^Color$/.test(nm)) return "vec(" + clsVar("UnityEngine." + nm) + (a.length ? ", " : "") + a.join(", ") + ")"; return nm + "(" + a.join(", ") + ")"; }
+if (n.f.k === "mem") { const bc = asClass(n.f.o); if (bc && /(^|\.)(Debug|Console)$/.test(bc)) return "console.log(" + a.join(", ") + ")"; if (n.f.n === "GetComponent" && n.f.ga) return "comp(" + E(n.f.o) + ", " + q(n.f.ga[0]) + ")"; return "call(" + E(n.f.o) + ", " + q(n.f.n) + (a.length ? ", " : "") + a.join(", ") + ")"; }
+return "(" + E(n.f) + ")(" + a.join(", ") + ")";
+}
+case "new": { const nm = n.names[n.names.length - 1]; if (/^Vector[234]$|^Quaternion$|^Color$/.test(nm)) return "vec(" + clsVar("UnityEngine." + nm) + (n.a.length ? ", " : "") + n.a.map(E).join(", ") + ")"; return "/* cannot construct " + nm + " here */ null"; }
+case "un": return "(" + n.op + E(n.e) + ")";
+case "cast": return n.ty === "int" || n.ty === "long" ? "Math.trunc(" + E(n.e) + ")" : n.ty === "string" ? "String(" + E(n.e) + ")" : "(" + E(n.e) + ")";
+case "cond": return "(" + E(n.c) + " ? " + E(n.a) + " : " + E(n.b) + ")";
+case "bin": {
+if ((n.op === "==" || n.op === "!=") && (n.r.k === "null" || n.l.k === "null")) { const x = n.r.k === "null" ? n.l : n.r; return (n.op === "==" ? "" : "!") + "nul(" + E(x) + ")"; }
+if (n.op === "??") return "(nul(" + E(n.l) + ") ? " + E(n.r) + " : " + E(n.l) + ")";
+return "(" + E(n.l) + " " + (n.op === "==" ? "===" : n.op === "!=" ? "!==" : n.op) + " " + E(n.r) + ")";
+}
+case "post": return E(n.e) + n.op;
+case "asg": {
+if (n.l.k === "mem") { const o = E(n.l.o); if (n.op === "=") return "set(" + o + ", " + q(n.l.n) + ", " + E(n.r) + ")"; return "set(" + o + ", " + q(n.l.n) + ", get(" + o + ", " + q(n.l.n) + ") " + n.op[0] + " " + E(n.r) + ")"; }
+return E(n.l) + " " + n.op + " " + E(n.r);
+}
+}
+return "/* unsupported " + n.k + " */ null";
+};
+const lines = [];
+const S_ = (n, d) => {
+const p = "  ".repeat(d);
+switch (n.k) {
+case "block": lines.push(p + "{"); declared.push(new Set()); n.b.forEach((x) => S_(x, d + 1)); declared.pop(); lines.push(p + "}"); break;
+case "var": declared[declared.length - 1].add(n.n); lines.push(p + "let " + n.n + (n.e ? " = " + E(n.e) : "") + ";"); break;
+case "expr": lines.push(p + E(n.e) + ";"); break;
+case "if": lines.push(p + "if (" + E(n.c) + ")"); S_(n.a, d); if (n.b) { lines.push(p + "else"); S_(n.b, d); } break;
+case "while": lines.push(p + "while (" + E(n.c) + ")"); S_(n.b, d); break;
+case "for": { declared.push(new Set()); const init = n.init ? (n.init.k === "var" ? (declared[declared.length - 1].add(n.init.n), "let " + n.init.n + (n.init.e ? " = " + E(n.init.e) : "")) : E(n.init.e)) : ""; lines.push(p + "for (" + init + "; " + (n.c ? E(n.c) : "") + "; " + (n.st ? E(n.st) : "") + ")"); S_(n.b, d); declared.pop(); break; }
+case "foreach": declared.push(new Set([n.n])); lines.push(p + "for (const " + n.n + " of iter(" + E(n.e) + "))"); S_(n.b, d); declared.pop(); break;
+case "ret": lines.push(p + "return" + (n.e ? " " + E(n.e) : "") + ";"); break;
+case "brk": lines.push(p + "break;"); break;
+case "cont": lines.push(p + "continue;"); break;
+case "cmd": {
+if (n.name === "hold") { const a = n.e; lines.push(p + "setInterval(() => set(" + E(a.l.o) + ", " + q(a.l.n) + ", " + E(a.r) + "), 100);"); break; }
+if (n.name === "hooks" || n.name === "help" || n.name === "release") { lines.push(p + "// " + n.name + " (live tool command, nothing to translate)"); break; }
+if (n.name === "unhook") { lines.push(p + "// unhook: revert with m.revert() on the method you hooked"); break; }
+const t = n.target, joined = t.names.slice(0, -1).join("."), mname = t.names[t.names.length - 1];
+const full = (RT && RT.ok && csClass(joined)) || joined, kv = clsVar(full), argc = t.argc >= 0 ? t.argc : 0;
+const body = n.name === "patch" ? (n.nop ? "return;" : "return " + E(n.body.ast) + ";") : "return (" + n.body + ");";
+lines.push(p + "{ const m = " + kv + ".method(" + q(mname) + ", " + argc + "); m.implementation = function (...args) { const orig = () => (this && this.method ? this.method(" + q(mname) + ", " + argc + ").invoke(...args) : m.invoke(...args)); " + body + " }; }");
+break;
+}
+}
+};
+prog.forEach((st) => S_(st, 1));
+const head = [
+'import "frida-il2cpp-bridge";',
+"",
+"Il2Cpp.perform(() => {",
+"  const K = (asm, name) => Il2Cpp.domain.assembly(asm).image.class(name);",
+"  const S = (s) => Il2Cpp.string(s);",
+"  const nul = (o) => o === null || o === undefined || (o.isNull && o.isNull());",
+"  const get = (o, n) => { try { return o.field(n).value; } catch (e) { return o.method(\"get_\" + n).invoke(); } };",
+"  const set = (o, n, v) => { try { o.field(n).value = v; } catch (e) { o.method(\"set_\" + n).invoke(v); } };",
+"  const call = (o, n, ...a) => o.method(n, a.length).invoke(...a);",
+"  const len = (o) => (o.length !== undefined ? o.length : get(o, \"Count\"));",
+"  const idx = (o, i) => (o.get ? o.get(i) : o[i]);",
+"  const iter = (e) => (Array.isArray(e) ? e : Array.from(e));",
+"  const vec = (k, ...c) => { const o = k.new(); o.method(\".ctor\", c.length).invoke(...c); return o.unbox(); };",
+"  const GO = K(\"UnityEngine.CoreModule\", \"UnityEngine.GameObject\");",
+"  const findAll = (x) => { const r = []; for (const a of Il2Cpp.domain.assemblies) { const k = a.image.tryClass(x); if (k) return Il2Cpp.gc.choose(k); } return Il2Cpp.gc.choose(GO).filter((g) => get(g, \"name\") === x); };",
+"  const find = (x) => { if (typeof x !== \"string\") return x; const g = GO.method(\"Find\").invoke(S(x)); if (!nul(g)) return g; return findAll(x)[0] ?? null; };",
+"  const findByName = (x) => { const g = GO.method(\"Find\").invoke(S(x)); return nul(g) ? null : g; };",
+"  const comp = (o, T) => call(o, \"GetComponent\", Il2Cpp.domain.assemblies.map((a) => a.image.tryClass(T)).find((k) => k).type.object);"
+];
+const consts = Array.from(classes, ([id, c]) => "  const " + id + " = K(" + q(c.asm) + ", " + q(c.full) + ");");
+return head.concat(["  // classes"], consts, ["", "  // your script"], lines, ["});"]).join("\n");
+}
 
 // ===================================================================================================
 // UI: gold glass panel in its own iframe (so the game never sees your key presses)
@@ -1353,14 +1766,14 @@ R_(lbl("Developer mode", "marks debugging as allowed"), groupSw("dev_active")),
 devActiveSel
 ].concat(DEV.map((d) => R_(lbl(d.title, d.sub), groupSw("dev" + d.f)))), "dev");
 const walletCard = card("Wallet", [
-R_(lbl("Add coins"), RR(num(() => incC.coins, (v) => { incC.coins = Math.round(v); }, true), btn("Add", () => { try { walletAdd("coins", incC.coins); say("added coins"); } catch (e) { say(String(e.message || e)); } }, "", "plus"))),
-R_(lbl("Add keys"), RR(num(() => incC.keys, (v) => { incC.keys = Math.round(v); }, true), btn("Add", () => { try { walletAdd("keys", incC.keys); say("added keys"); } catch (e) { say(String(e.message || e)); } }, "", "plus"))),
-el("div", { className: "note", textContent: "Calls the game's own InventorySave methods." })
+R_(lbl("Add coins"), RR(num(() => incC.coins, (v) => { incC.coins = Math.round(v); }, true), btn("Add", () => { try { say("coins " + walletAdd("coins", incC.coins)); } catch (e) { say(String(e.message || e)); } }, "", "plus"))),
+R_(lbl("Add keys"), RR(num(() => incC.keys, (v) => { incC.keys = Math.round(v); }, true), btn("Add", () => { try { say("keys " + walletAdd("keys", incC.keys)); } catch (e) { say(String(e.message || e)); } }, "", "plus"))),
+el("div", { className: "note", textContent: "Calls the game's own InventorySave.SetCoins / SetKeys and shows the amount before and after." })
 ], "dev");
 const pageDev = el("div", { className: "pg hide" }, [devCard, walletCard]);
 
 // ===== EXPLORER =====
-const ex = { view: "objects", cls: null, objs: [], obj: null, stack: [], locks: new Map(), mapCls: "SYBO.Subway.Level.MovingTrain" };
+const ex = { view: "objects", cls: null, objs: [], obj: null, stack: [], locks: new Map() };
 const exSearch = el("input", { type: "text", className: "txt", placeholder: "search class or namespace...", spellcheck: false });
 const exList = el("div", { className: "tbl" }), exHead = el("div", { className: "note" }), exFields = el("div", { className: "tbl" }), exNav = el("div", { className: "btns" });
 const exObjCard = card("Objects", [exSearch, exList], "list");
@@ -1384,6 +1797,16 @@ const r = el("div", { className: "tr" }, [el("div", { className: "nm link", text
 r.firstChild.onclick = () => { ex.cls = i; ex.objs = (RT.objs.get(i) || []).slice(0, 60); ex.obj = null; ex.stack = []; exRender(); };
 exList.appendChild(r);
 });
+// objects by their Unity name (characters, prefab instances, scene objects)
+if (q.length >= 3) {
+const hits = objectNames().filter((h) => h.name.toLowerCase().indexOf(q) >= 0).slice(0, 60);
+if (hits.length) exList.appendChild(el("div", { className: "tr" }, [el("div", { className: "ttl" }, [D.createTextNode("Objects named like \"" + q + "\"")])]));
+hits.forEach((h) => {
+const r = el("div", { className: "tr" }, [el("div", { className: "nm link", textContent: h.name, title: hex(h.ptr) }), el("div", { className: "ty", textContent: "GameObject" })]);
+r.firstChild.onclick = () => { ex.cls = null; ex.obj = h.ptr; ex.stack = []; exRender(); };
+exList.appendChild(r);
+});
+}
 }
 function exOpen(addr, push) { if (push && ex.obj) ex.stack.push(ex.obj); ex.obj = addr; exRender(); }
 function getterRow(m, a) {
@@ -1428,6 +1851,7 @@ const a = ex.obj, ins = RT.inspect(a);
 exNav.appendChild(btn("Back", () => { ex.obj = ex.stack.pop() || null; exRender(); }, "", "back"));
 exNav.appendChild(btn("Refresh", exRender, "", "refresh"));
 exNav.appendChild(btn("Copy address", () => copyText(hex(a)), "", "copy"));
+if (ins) exNav.appendChild(btn("C# source", () => { const ti = RT.typedefOfKlass(ins.klass); if (ti >= 0) { showSource(ti); setSub("classes"); } }, "", "console"));
 if (!ins) { exHead.textContent = "not a game object (" + hex(a) + ")"; return; }
 exHead.textContent = ins.name + " @ " + hex(a) + "   (" + ins.parents.slice(1, 4).join(" < ") + ")";
 const arr = RT.arrayInfo(a);
@@ -1485,42 +1909,48 @@ if (others.length) { exFields.appendChild(el("div", { className: "tr" }, [el("di
 }
 exSearch.addEventListener("input", () => { clearTimeout(exSearch.__t); exSearch.__t = setTimeout(exClasses, 200); });
 
-// map: flat top-down view of live objects, positions read through Unity's own Transform getters
-const mapCanvas = el("canvas", { className: "map", width: 700, height: 460 });
-const mapIn = el("input", { type: "text", className: "txt", placeholder: "class to plot, e.g. SYBO.Subway.Level.MovingTrain", spellcheck: false, value: ex.mapCls });
-const mapInfo = el("div", { className: "note" });
-let mapTimer = 0;
-function mapDraw() {
-const c = mapCanvas.getContext("2d");
-c.clearRect(0, 0, mapCanvas.width, mapCanvas.height);
-if (!RT || !RT.ok) { mapInfo.textContent = "waiting for the game..."; return; }
-try {
-const me = RT.find("SYBO.Subway.Characters.Character")[0];
-const p0 = me ? posOfObj(me) : [0, 0, 0];
-const list = RT.find(mapIn.value.trim()).slice(0, 300);
-const pts = [];
-for (const o of list) { try { const p = posOfObj(o); if (p) pts.push(p); } catch (e) {} }
-const W_ = mapCanvas.width, H_ = mapCanvas.height, sc = 6;
-c.strokeStyle = "rgba(255,255,255,.15)"; c.lineWidth = 1;
-for (let x = -4; x <= 4; x += 2) { c.beginPath(); c.moveTo(W_ / 2 + x * sc * 4, 0); c.lineTo(W_ / 2 + x * sc * 4, H_); c.stroke(); }
-c.fillStyle = THEMES[S.theme].ac;
-pts.forEach((p) => { const x = W_ / 2 + (p[0] - p0[0]) * sc * 2, y = H_ - 40 - (p[2] - p0[2]) * sc; if (x > -10 && x < W_ + 10 && y > -10 && y < H_ + 10) c.fillRect(x - 4, y - 4, 8, 8); });
-c.fillStyle = "#fff"; c.beginPath(); c.arc(W_ / 2, H_ - 40, 9, 0, 7); c.fill();
-mapInfo.textContent = list.length + " objects, " + pts.length + " positions read" + (me ? "" : " (player not found)");
-} catch (e) { mapInfo.textContent = "map: " + (e.message || e); }
+// classes: every type in the game (also the ones with no live object), and a read-only C# view of any of them
+const srcState = { ti: null };
+const clsSearch = el("input", { type: "text", className: "txt", placeholder: "search any class, enum or namespace...", spellcheck: false });
+const clsList = el("div", { className: "tbl" });
+const srcHead = el("div", { className: "note", textContent: "pick a class to see its C# declaration" }), srcOut = el("pre", { className: "out", textContent: "" });
+srcOut.style.maxHeight = "340px";
+function clsRender() {
+clsList.innerHTML = "";
+if (!RT || !RT.ok) { clsList.appendChild(el("div", { className: "tr" }, [el("div", { className: "nm", textContent: "waiting for the game..." })])); return; }
+const q = clsSearch.value.trim().toLowerCase(), m = RT.meta, rows = [];
+for (let i = 0; i < m.T.length; i++) {
+const nm = m.name(i);
+if (/[<>]/.test(nm)) continue;
+if (q ? nm.toLowerCase().indexOf(q) < 0 : (i < m.gameStart || i >= m.gameStart + m.gameCount)) continue;
+rows.push([nm, i]);
 }
-const mapCard = card("Flat map", [
-mapIn, mapCanvas, mapInfo,
-el("div", { className: "btns" }, [btn("Plot", () => { ex.mapCls = mapIn.value.trim(); mapDraw(); }, "hot", "map"), btn("Live", function () { if (mapTimer) { clearInterval(mapTimer); mapTimer = 0; this.classList.remove("hot"); } else { mapTimer = setInterval(mapDraw, 500); this.classList.add("hot"); } }, "", "play")]),
-el("div", { className: "note", textContent: "A top-down view of one class around the player (the white dot). Unity's real 3D scene cannot be drawn from outside the game, so this plots positions only." })
-], "map");
+rows.sort((a, b) => (a[0] < b[0] ? -1 : 1));
+rows.slice(0, 200).forEach(([nm, i]) => {
+const kind = m.isEnum(i) ? "enum" : (m.T[i].flags & 0x20) ? "interface" : "class";
+const r = el("div", { className: "tr" }, [el("div", { className: "nm link", textContent: nm, title: nm + "  (" + m.assemblyOf(i) + ")" }), el("div", { className: "ty", textContent: kind })]);
+r.firstChild.onclick = () => showSource(i);
+clsList.appendChild(r);
+});
+if (rows.length > 200) clsList.appendChild(el("div", { className: "tr" }, [el("div", { className: "nm", textContent: "... " + (rows.length - 200) + " more, narrow the search" })]));
+}
+function showSource(ti) {
+if (!RT || !RT.ok) return;
+srcState.ti = ti;
+const full = RT.meta.name(ti);
+srcHead.textContent = full + "  \u2022  " + RT.meta.assemblyOf(ti) + "  \u2022  " + (RT.objs.get(ti) || []).length + " live object(s)  \u2022  view only (the method bodies are compiled to native code, so they cannot be shown or edited)";
+srcOut.textContent = RT.classSource(ti); srcOut.scrollTop = 0;
+}
+clsSearch.addEventListener("input", () => { clearTimeout(clsSearch.__t); clsSearch.__t = setTimeout(clsRender, 200); });
+const exClsCard = card("Classes", [clsSearch, clsList], "cube");
+const exSrcCard = card("C# preview (view only)", [srcHead, srcOut, el("div", { className: "btns" }, [btn("Copy", () => copyText(srcOut.textContent), "", "copy"), btn("Live objects", () => { const ti = srcState.ti; if (ti === null) return; ex.cls = ti; ex.objs = (RT.objs.get(ti) || []).slice(0, 60); ex.obj = null; ex.stack = []; setSub("objects"); exRender(); }, "", "list")])], "console");
 const subBar = el("div", { className: "sub" });
-const pageEx = el("div", { className: "pg hide" }, [subBar, exObjCard, exInspCard, mapCard]);
-function setSub(v) { ex.view = v; exObjCard.style.display = v === "objects" ? "" : "none"; exInspCard.style.display = v === "objects" ? "" : "none"; mapCard.style.display = v === "map" ? "" : "none"; Array.from(subBar.children).forEach((b) => b.classList.toggle("on", b.__v === v)); }
-[["objects", "Objects", "list"], ["map", "Map", "map"]].forEach(([v, t, ic]) => { const b = btn(t, () => setSub(v), "", ic); b.__v = v; subBar.appendChild(b); });
+const pageEx = el("div", { className: "pg hide" }, [subBar, exObjCard, exInspCard, exClsCard, exSrcCard]);
+function setSub(v) { ex.view = v; const o = v === "objects"; exObjCard.style.display = o ? "" : "none"; exInspCard.style.display = o ? "" : "none"; exClsCard.style.display = o ? "none" : ""; exSrcCard.style.display = o ? "none" : ""; Array.from(subBar.children).forEach((b) => b.classList.toggle("on", b.__v === v)); if (!o) clsRender(); }
+[["objects", "Objects", "list"], ["classes", "Classes", "cube"]].forEach(([v, t, ic]) => { const b = btn(t, () => setSub(v), "", ic); b.__v = v; subBar.appendChild(b); });
 
 // ===== CONSOLE: C# style invoker/patcher (JavaScript with ss.* still works) =====
-const conIn = el("textarea", { className: "txt", spellcheck: false, placeholder: "// C# style, runs against the live game\nvar gs = find(GameStats)\ngs.TriggerPowerup(UpgradeType.jetpack, false)\nData.Save.InventorySave.IncreaseCoins(5000, \"mod\")\nhook SYBO.Subway.Pickups.Picker.Pickers.BasePicker.get_ProbabilityToSpawn => 1.0\nhooks" });
+const conIn = el("textarea", { className: "txt", spellcheck: false, placeholder: "// C# on the live game\nvar jake = find(\"Jake\");\nif (jake != null) {\n  var t = jake.transform;\n  t.localScale = new Vector3(2f, 2f, 2f);\n}" });
 const conOut = el("pre", { className: "out", textContent: "(output)" }), macroBox = el("div", { className: "btns" });
 const macroName = el("input", { type: "text", className: "txt", placeholder: "name for a custom button..." });
 const api = {
@@ -1536,7 +1966,7 @@ call: (a, n, ...args) => { const m = RT.findMethod(RT.rw(a), n, args.length); if
 callStatic: (cls, n, ...args) => RT.staticCall(cls, n, args),
 runtimeInvoke: (mi, obj, ...args) => RT.runtimeInvoke(mi, obj, args),
 newString: (s) => RT.newString(s),
-hook: HOOKS, cs: (src) => csRun(src),
+hook: HOOKS, cs: (src) => csRun(src), frida: (src) => csToFrida(src), wallet: (k, n) => walletAdd(k, n), names: () => objectNames(true), source: (ti) => RT.classSource(ti), inRun: () => inRun(),
 rescan: () => RT.refresh(true), u32: (a) => RT.M.HEAPU32[a >>> 2], f32: (a) => RT.M.HEAPF32[a >>> 2],
 setU32: (a, v) => { RT.M.HEAPU32[a >>> 2] = v >>> 0; }, setF32: (a, v) => { RT.M.HEAPF32[a >>> 2] = v; },
 Module: () => getModule(), say
@@ -1548,21 +1978,23 @@ function drawMacros() {
 macroBox.innerHTML = "";
 S.macros.forEach((m, i) => { const b = btn(m.name, () => { try { const r = runCode(m.code); say(typeof r === "string" ? r.split("\n")[0].slice(0, 70) : m.name + " ran"); } catch (e) { say(m.name + ": " + (e.message || e)); } }, "", "play"); b.oncontextmenu = (e) => { e.preventDefault(); S.macros.splice(i, 1); persist(); drawMacros(); }; macroBox.appendChild(b); });
 }
-if (!S.seeded) {
-S.seeded = true;
-S.macros = [
-{ name: "Jetpack", code: "SYBO.Subway.Game.PickupJetpack()" },
-{ name: "Pogo stick", code: "SYBO.Subway.Game.PickupPogostick()" },
-{ name: "Magnet", code: "GameStats.TriggerPowerup(UpgradeType.coinmagnet, false)" },
-{ name: "Sneakers", code: "GameStats.TriggerPowerup(UpgradeType.supersneakers, false)" },
-{ name: "2x score", code: "GameStats.TriggerPowerup(UpgradeType.doubleMultiplier, false)" },
-{ name: "+1M coins", code: "Data.Save.InventorySave.IncreaseCoins(1000000, \"mod\")" }
-].concat(S.macros);
+if (S.seeded !== 2) {
+S.seeded = 2;
+const defs = [
+{ name: "Jetpack", code: 'if (!inRun()) print("start a run first"); else SYBO.Subway.Game.PickupJetpack();' },
+{ name: "Pogo stick", code: 'if (!inRun()) print("start a run first"); else SYBO.Subway.Game.PickupPogostick();' },
+{ name: "Magnet", code: 'if (!inRun()) print("start a run first"); else GameStats.TriggerPowerup(UpgradeType.coinmagnet, false);' },
+{ name: "Sneakers", code: 'if (!inRun()) print("start a run first"); else GameStats.TriggerPowerup(UpgradeType.supersneakers, false);' },
+{ name: "2x score", code: 'if (!inRun()) print("start a run first"); else GameStats.TriggerPowerup(UpgradeType.doubleMultiplier, false);' },
+{ name: "+1M coins", code: 'ss.wallet("coins", 1000000)' }
+];
+const names = new Set(defs.map((d) => d.name));
+S.macros = defs.concat(S.macros.filter((m) => !names.has(m.name)));
 persist();
 }
 const pageCon = el("div", { className: "pg hide" }, [
-card("Custom code", [conIn, el("div", { className: "btns" }, [btn("Run", () => { try { const v = runCode(conIn.value); conOut.textContent = v === undefined ? "ok" : (typeof v === "object" ? JSON.stringify(v, null, 1) : String(v)); } catch (e) { conOut.textContent = "error: " + (e.message || e); } }, "hot", "play"), btn("Clear", () => { conIn.value = ""; conOut.textContent = "(output)"; }, "", "trash")]), conOut,
-el("div", { className: "note", textContent: "C# style on the live game: Class.Method(args), find(Class), obj.field = v, hold, hook / patch / unhook, hooks. Type help. JavaScript with ss.* still works too." })], "console"),
+card("Custom code", [conIn, el("div", { className: "btns" }, [btn("Run", () => { try { const v = runCode(conIn.value); conOut.textContent = v === undefined ? "ok" : (typeof v === "object" ? JSON.stringify(v, null, 1) : String(v)); } catch (e) { conOut.textContent = "error: " + (e.message || e); } }, "hot", "play"), btn("Clear", () => { conIn.value = ""; conOut.textContent = "(output)"; }, "", "trash")]), el("div", { className: "btns" }, [btn("To Frida JS", () => { conOut.textContent = looksJS(conIn.value) ? "// this is already JavaScript" : csToFrida(conIn.value); }, "", "console"), btn("Copy output", () => copyText(conOut.textContent), "", "copy")]), conOut,
+el("div", { className: "note", textContent: "Real C# subset on the live game: var x = find(\"Jake\"); x.transform.localScale = new Vector3(2,2,2); if / for / foreach; Class.Method(args); hold, hook, patch, hooks. find(\"Name\") searches classes, then GameObject names. To Frida JS turns your code into frida-il2cpp-bridge JavaScript. Type help. JavaScript with ss.* still works too." })], "console"),
 card("My buttons", [macroName, el("div", { className: "btns" }, [btn("Save code as button", () => { const n = macroName.value.trim(); if (!n || !conIn.value.trim()) { say("give it a name and some code"); return; } S.macros.push({ name: n, code: conIn.value }); persist(); drawMacros(); macroName.value = ""; }, "", "plus")]), macroBox, el("div", { className: "note", textContent: "Right-click or long-press a custom button to delete it." })], "console")
 ]);
 
@@ -1602,7 +2034,7 @@ pill.style.transform = "translateX(" + (i * 100) + "%)";
 tabEls.forEach((t, j) => t.classList.toggle("on", j === i));
 TABS.forEach(([, , p], j) => p.classList.toggle("hide", j !== i));
 if (i === 0) { chunkRender(); pkRender(); }
-if (i === 2) { exClasses(); exRender(); }
+if (i === 2) { exClasses(); exRender(); if (ex.view === "classes") clsRender(); }
 };
 BODY = el("div", { className: "b" }, TABS.map((t) => t[2]));
 const rs = el("div", { className: "rs", title: "drag to resize" });
@@ -1663,8 +2095,8 @@ stat.className = "stat " + state; statTxt.textContent = text;
 saveInfo.textContent = "engine save sync: " + SAVE.engine + "\nbackup files: " + SAVE.files + (SAVE.lastBackup ? "  (last " + new Date(SAVE.lastBackup).toLocaleTimeString() + ")" : "") + "\nrestored this session: " + SAVE.restored + (SAVE.err ? "\nnote: " + SAVE.err : "");
 if (S.tab === 5) logOut.textContent = LOG.slice(-60).join("\n");
 if (S.tab === 1 && RT && RT.ok) {
-const f = RT.find(DEVC)[0];
-devActiveSel.textContent = f ? "DebugSettings found (" + hex(f) + ")" : "DebugSettings object not found yet (it is created when a run or the menu loads)";
+const f = RT.liveAll(DEVC)[0];
+devActiveSel.textContent = f ? "DebugSettings found (" + hex(f) + ")" : "DebugSettings does not exist yet, the game only creates it on demand. Switch a setting on twice to try creating it.";
 }
 if (S.tab === 2) exRows.forEach(([inp, f, a]) => { if (D.activeElement === inp) return; try { const s = f.enumTi >= 0 ? String(RT.read(a, f)) : RT.show(a, f); if (inp.value !== s) inp.value = s; } catch (e) {} });
 }, 600);
