@@ -428,6 +428,8 @@ if (i) { let msg = ""; const f = R.fieldOf(p, "_message") || R.fieldOf(p, "messa
 return "the game threw " + e;
 }
 const s = String(e && e.message || e);
+const EA = typeof window !== "undefined" && window.__ssEarly;
+if (/abort\(/.test(s) && EA && EA.lastThrow && EA.lastThrow.ex && Date.now() - EA.lastThrow.t < 3000) { const d = R.explain(EA.lastThrow.ex); if (/^managed exception/.test(d)) return s + "  <-  " + d; }
 if (/abort\(/.test(s)) return s + " (an unhandled managed exception inside the game; usually the game is not in the right state, for example no run is active)";
 return s;
 };
@@ -476,7 +478,7 @@ const PRIM = new Set(["System.Int32", "System.UInt32", "System.Int16", "System.U
 const STRUCT = { "UnityEngine.Vector3": 3, "UnityEngine.Vector2": 2, "UnityEngine.Quaternion": 4, "UnityEngine.Color": 4, "UnityEngine.Vector4": 4 };
 R.STRUCT = STRUCT;
 R.table = () => {
-const c = [M.wasmTable, M.asm && M.asm.__indirect_function_table, M.asm && M.asm.table, M.asm && M.asm.__table];
+const c = [M.wasmTable, M.asm && M.asm.__indirect_function_table, M.asm && M.asm.table, M.asm && M.asm.__table, typeof window !== "undefined" && window.__ssEarly && window.__ssEarly.table];
 return c.find((t) => t && typeof t.get === "function") || null;
 };
 // wasm value class of a C# type name: i f d j, v (void), S (known struct, passed by pointer) or null (unsupported struct)
