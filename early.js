@@ -33,7 +33,9 @@ return orig.apply(this, args);
 
 function wrapImports(imports) {
 if (!imports || typeof imports !== "object") return;
+// only "env" holds the JS functions Unity calls. In this build the "parent" namespace is the Module object itself, so it is left alone.
 for (const m of Object.keys(imports)) {
+if (m !== "env") continue;
 const ns = imports[m]; if (!ns || typeof ns !== "object") continue;
 for (const k of Object.keys(ns)) {
 const f = ns[k]; if (typeof f !== "function" || SKIP.test(k)) continue;
