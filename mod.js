@@ -1011,9 +1011,24 @@ card("Theme", [el("div", { className: "btns" }, Object.keys(THEMES).map((n) => {
 card("Log", [logOut], "list")
 ]);
 
-const TABS = [["Spawn", "spawn", pageSpawn], ["Dev", "dev", pageDev], ["Explore", "explorer", pageEx], ["Code", "console", pageCon], ["Save", "save", pageSave], ["Prefs", "prefs", pagePrefs]];
-const pill = el("div", { className: "pill" }); pill.style.width = "calc((100% - 6px) / " + TABS.length + ")";
-const tabEls = TABS.map(([name, ic], i) => { const t = el("div", { className: "tab" }, [icon(ic, 16), D.createTextNode(name)]); t.onclick = () => setTab(i); return t; });
+// Corrected Tab and UI Array Definitions (around line 405)
+const TABS = [
+    ["Spawn", "spawn", pageSpawn], 
+    ["Dev", "dev", pageDev], 
+    ["Explore", "explorer", pageEx], 
+    ["Code", "console", pageCon], 
+    ["Save", "save", pageSave], 
+    ["Prefs", "prefs", pagePrefs]
+];
+
+const pill = el("div", { className: "pill" }); 
+pill.style.width = "calc((100% - 6px) / " + TABS.length + ")";
+
+const tabEls = TABS.map(([name, ic], i) => { 
+    const t = el("div", { className: "tab" }, [icon(ic, 16), D.createTextNode(name)]); 
+    t.onclick = () => setTab(i); 
+    return t; 
+});
 const setTab = (i) => {
 S.tab = i; persist();
 uiOpen.explorer = i === 2; uiOpen.spawn = i === 0;
