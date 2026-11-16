@@ -1885,7 +1885,7 @@ if (!MS.prev.length) { list.appendChild(el("div", { className: "tr" }, [el("div"
 MS.prev.slice(0, 300).forEach((addr) => {
 const v = msRead(addr, MS.type);
 const a = el("div", { className: "nm", textContent: "0x" + addr.toString(16).padStart(8, "0") }); a.style.color = "#aaa";
-const vv = el("div", { className: "nm", textContent = "= " + v }); 
+const vv = el("div", { className: "nm", textContent: "= " + v });
 const inp = el("input", { type: "text", spellcheck: false, placeholder: "new" });
 const setBtn = ibtn("target", () => { msWrite(addr, MS.type, parseFloat(inp.value)); render(); }, "set");
 list.appendChild(el("div", { className: "tr" }, [a, vv, inp, setBtn]));
