@@ -1727,24 +1727,42 @@ if (!RT || !RT.ok) { say("Wait for game connection"); return; }
 scanGuiBtn.disabled = true;
 scanGuiBtn.textContent = "Scanning...";
 gui.list = [];
-await new Promise(r => setTimeout(r, 50)); // Let UI update
+await new Promise(r => setTimeout(r, 50));
 
 try {
-// liveAll filters out destroyed objects, saving thousands of useless checks
+// Find the methods once to speed up the loop
+const getActive = RT.findMethod(RT.klassByName("UnityEngine.GameObject"), "get_activeInHierarchy", 0);
+const getGo = RT.findMethod(RT.klassByName("UnityEngine.Component"), "get_gameObject", 0);
+
 const texts = RT.liveAll("UnityEngine.UI.Text");
 const images = RT.liveAll("UnityEngine.UI.Image");
 const allItems = [...texts.map(t => ({ obj: t, type: "Text" })), ...images.map(i => ({ obj: i, type: "Image" }))];
 
 for (let i = 0; i < allItems.length; i++) {
 const it = allItems[i];
+try {
+// 1. Check if the GameObject is actually active on screen
+const go = RT.invoke(getGo, it.obj, []);
+if (!go) continue;
+const isActive = RT.invokeF(getActive, go, []);
+if (!isActive) continue;
+
+// 2. Check if it actually has content
+if (it.type === "Text") {
+const txt = RT.invokeF(RT.findMethod(RT.rw(it.obj), "get_text", 0), it.obj, []);
+if (!txt || txt.trim() === "") continue; 
+} 
+
+// 3. Get the name (now that we know it's actually on screen)
 const name = unityName(it.obj);
-// Only add if it has a real name (skips empty/null UI)
-if (name && name !== "Text" && name !== "Image") {
-gui.list.push({ obj: it.obj, type: it.type, name: name });
+if (name) {
+gui.list.push({ obj: it.obj, type: it.type, name: name + " (" + it.type + ")" });
 }
-// Yield every 50 items so the browser doesn't freeze
-if (i % 50 === 0) await new Promise(r => setTimeout(r, 0));
-if (gui.list.length > 300) break; // Cap the list to avoid DOM lag
+} catch (e) { /* skip objects that error out */ }
+
+// Yield to the browser every 20 items so it doesn't freeze
+if (i % 20 === 0) await new Promise(r => setTimeout(r, 0));
+if (gui.list.length > 150) break; // Stop at 150 to keep the UI fast
 }
 } catch (e) {
 say("Scan error: " + e.message);
@@ -1753,7 +1771,7 @@ say("Scan error: " + e.message);
 scanGuiBtn.disabled = false;
 scanGuiBtn.textContent = "Scan Game UI";
 guiRender();
-say(`Found ${gui.list.length} UI elements`);
+say(`Found ${gui.list.length} active UI elements`);
 }, "hot", "scan");
 
 const pageGui = el("div", { className: "pg hide" }, [
