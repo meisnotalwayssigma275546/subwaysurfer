@@ -1722,11 +1722,36 @@ guiList.appendChild(r);
 }
 guiSearch.addEventListener("input", () => guiRender());
 
-const scanGuiBtn = btn("Scan Game UI", () => {
+const scanGuiBtn = btn("Scan Game UI", async () => {
 if (!RT || !RT.ok) { say("Wait for game connection"); return; }
+scanGuiBtn.disabled = true;
+scanGuiBtn.textContent = "Scanning...";
 gui.list = [];
-RT.findAll("UnityEngine.UI.Text").forEach(t => gui.list.push({ obj: t, type: "Text", name: unityName(t) || "Text" }));
-RT.findAll("UnityEngine.UI.Image").forEach(i => gui.list.push({ obj: i, type: "Image", name: unityName(i) || "Image" }));
+await new Promise(r => setTimeout(r, 50)); // Let UI update
+
+try {
+// liveAll filters out destroyed objects, saving thousands of useless checks
+const texts = RT.liveAll("UnityEngine.UI.Text");
+const images = RT.liveAll("UnityEngine.UI.Image");
+const allItems = [...texts.map(t => ({ obj: t, type: "Text" })), ...images.map(i => ({ obj: i, type: "Image" }))];
+
+for (let i = 0; i < allItems.length; i++) {
+const it = allItems[i];
+const name = unityName(it.obj);
+// Only add if it has a real name (skips empty/null UI)
+if (name && name !== "Text" && name !== "Image") {
+gui.list.push({ obj: it.obj, type: it.type, name: name });
+}
+// Yield every 50 items so the browser doesn't freeze
+if (i % 50 === 0) await new Promise(r => setTimeout(r, 0));
+if (gui.list.length > 300) break; // Cap the list to avoid DOM lag
+}
+} catch (e) {
+say("Scan error: " + e.message);
+}
+
+scanGuiBtn.disabled = false;
+scanGuiBtn.textContent = "Scan Game UI";
 guiRender();
 say(`Found ${gui.list.length} UI elements`);
 }, "hot", "scan");
