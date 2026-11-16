@@ -1,4 +1,4 @@
-/* Subway Surfers (Unity WebGL 2019.4, IL2CPP) mod, v5 (Unified Explore/GUI)
+/* Subway Surfers (Unity WebGL 2019.4, IL2CPP) mod, v6 (Universal GUI Editor)
  * Load it in index.html BEFORE master-loader.js:   <script src="mod.js"></script>
  */
 (function () {
@@ -1529,7 +1529,7 @@ place();
 const statDot = el("div", { className: "d" }), statTxt = el("span", { textContent: "starting..." });
 const stat = el("div", { className: "stat" }, [statDot, statTxt, ibtn("refresh", () => { if (RT && RT.ok) RT.refresh(false); say("refreshing objects"); }, "refresh the object list")]);
 const minBtn = el("button", { className: "hb", title: "minimize" }, [icon("min", 14)]);
-const head = el("div", { className: "h" }, [el("div", { className: "logo" }, [icon("spawn", 18)]), el("div", { className: "ttl1" }, [D.createTextNode("Subway Surfers"), el("span", { className: "pro", textContent: "PRO" }), el("small", { textContent: "mod menu v5" })]), el("div", { className: "sp" }), minBtn]);
+const head = el("div", { className: "h" }, [el("div", { className: "logo" }, [icon("spawn", 18)]), el("div", { className: "ttl1" }, [D.createTextNode("Subway Surfers"), el("span", { className: "pro", textContent: "PRO" }), el("small", { textContent: "mod menu v6" })]), el("div", { className: "sp" }), minBtn]);
 
 // ===== SPAWN =====
 const chunkOut = el("div", { className: "tbl" }), chunkHead = el("div", { className: "note" });
@@ -1688,7 +1688,7 @@ r.firstChild.onclick = () => {
 ex.cls = i;
 let objs = RT.objs.get(i) || [];
 // Filter inactive UI elements to prevent confusion
-if (nm.includes("UnityEngine.UI.")) {
+if (nm.includes("UnityEngine.UI.") || nm.includes("UILabel")) {
 objs = objs.filter(o => {
 try {
 const go = RT.invoke(RT.findMethod(RT.klassByName("UnityEngine.Component"), "get_gameObject", 0), o, []);
@@ -1757,31 +1757,35 @@ if (ins) exNav.appendChild(btn("C# source", () => { const ti = RT.typedefOfKlass
 if (!ins) { exHead.textContent = "not a game object (" + hex(a) + ")"; return; }
 exHead.textContent = ins.name + " @ " + hex(a) + "   (" + ins.parents.slice(1, 4).join(" < ") + ")";
 
-// --- Live GUI Editor Injection ---
-if (RT.isSub(ins.klass, RT.klassByName("UnityEngine.UI.Text"))) {
-try {
-const getText = RT.findMethod(RT.klassByName("UnityEngine.UI.Text"), "get_text", 0);
-const setText = RT.findMethod(RT.klassByName("UnityEngine.UI.Text"), "set_text", 1);
-const getColor = RT.findMethod(RT.klassByName("UnityEngine.UI.Text"), "get_color", 0);
-const setColor = RT.findMethod(RT.klassByName("UnityEngine.UI.Text"), "set_color", 1);
+// --- Live GUI Editor Injection (Universal) ---
+const getText = RT.findMethod(ins.klass, "get_text", 0);
+const setText = RT.findMethod(ins.klass, "set_text", 1);
+const getColor = RT.findMethod(ins.klass, "get_color", 0);
+const setColor = RT.findMethod(ins.klass, "set_color", 1);
 
-const curText = RT.invokeF(getText, a, []) || "";
-const curColor = RT.invoke(getColor, a, []) || [1,1,1,1];
+if (getText && setText) {
+    try {
+        const curText = RT.invokeF(getText, a, []) || "";
+        let curColor = [1,1,1,1];
+        if (getColor) {
+            const c = RT.invoke(getColor, a, []);
+            if (Array.isArray(c) && c.length >= 3) curColor = c;
+        }
 
-const guiBox = card("GUI Editor", [
-R_(lbl("Text"), el("input", { type: "text", className: "txt", value: curText, oninput: (e) => { RT.invoke(setText, a, [RT.newString(e.target.value)]); } })),
-(() => {
-const hex = "#" + [curColor[0],curColor[1],curColor[2]].map(x => Math.round(Math.max(0, Math.min(1, x))*255).toString(16).padStart(2,'0')).join("");
-return R_(lbl("Color"), el("input", { type: "color", value: hex, style: "width:100%;height:30px;border:none;background:none;cursor:pointer;", oninput: (e) => {
-const r = parseInt(e.target.value.slice(1,3),16)/255;
-const g = parseInt(e.target.value.slice(3,5),16)/255;
-const b = parseInt(e.target.value.slice(5,7),16)/255;
-RT.invoke(setColor, a, [[r,g,b,1]]);
-} }));
-})()
-], "paint");
-exFields.appendChild(guiBox);
-} catch (e) {}
+        const guiBox = card("GUI Editor", [
+            R_(lbl("Text"), el("input", { type: "text", className: "txt", value: curText, oninput: (e) => { RT.invoke(setText, a, [RT.newString(e.target.value)]); } })),
+            getColor && setColor ? (() => {
+                const hex = "#" + [curColor[0],curColor[1],curColor[2]].map(x => Math.round(Math.max(0, Math.min(1, x))*255).toString(16).padStart(2,'0')).join("");
+                return R_(lbl("Color"), el("input", { type: "color", value: hex, style: "width:100%;height:30px;border:none;background:none;cursor:pointer;", oninput: (e) => {
+                    const r = parseInt(e.target.value.slice(1,3),16)/255;
+                    const g = parseInt(e.target.value.slice(3,5),16)/255;
+                    const b = parseInt(e.target.value.slice(5,7),16)/255;
+                    RT.invoke(setColor, a, [[r,g,b,curColor[3]||1]]);
+                } }));
+            })() : null
+        ], "paint");
+        exFields.appendChild(guiBox);
+    } catch (e) {}
 }
 // --------------------------------
 
@@ -2059,11 +2063,11 @@ setInterval(() => { ex.locks.forEach((L) => { try { RT.write(L.a, L.f, L.v); } c
 
 applyLook(); drawMacros(); setSub("objects");
 setTab(S.tab >= 0 && S.tab < TABS.length ? S.tab : 0);
-dlog("Subway Surfers mod v5 ready");
+dlog("Subway Surfers mod v6 ready");
 }
 
 if (document.body) buildUI(); else addEventListener("DOMContentLoaded", buildUI);
 window.__ssRT = () => RT;
-dlog("Subway Surfers mod v5 loaded, GUI merged into Explore");
+dlog("Subway Surfers mod v6 loaded, Universal GUI merged into Explore");
 
 })();
