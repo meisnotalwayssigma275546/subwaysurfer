@@ -1,5 +1,5 @@
-/* Subway Surfers (Unity WebGL 2019.4, IL2CPP) mod, v7 (Dedicated GUI Tab)
- * Load it in index.html BEFORE master-loader.js:   <script src="mod.js"></script>
+/* Subway Surfers (Unity WebGL 2019.4, IL2CPP) mod, v8 (Clean Stable)
+ * Load it in index.html BEFORE master-loader.js
  */
 (function () {
 if (window.__ssMod) return;
@@ -894,7 +894,7 @@ function releaseAll() { try { GROUPS.forEach((g) => { g.on = false; }); ovReleas
 addEventListener("error", (ev) => { const msg = String(ev && ev.message || ""); if (/abort\(/.test(msg) && (OV.size || HK.size)) { releaseAll(); dlog("game aborted, released writes"); } });
 
 // ---------- boot ----------
-let uiOpen = { explorer: false, spawn: false, scan: false, gui: false };
+let uiOpen = { explorer: false, spawn: false, scan: false };
 async function bootTick() {
 const M = getModule();
 if (!M || !M.HEAPU8 || !M.asm) { if (!RT) return; return; }
@@ -902,7 +902,7 @@ if (!RT) RT = makeRT(M, dlog);
 if (!RT.connected) { await RT.connect(); return; }
 const active = GROUPS.size && Array.from(GROUPS.values()).some((g) => g.on) || OV.size > 0;
 const age = Date.now() - RT.lastScan;
-const need = !RT.ok || age > (active || uiOpen.explorer || uiOpen.spawn || uiOpen.scan || uiOpen.gui ? 4000 : 15000);
+const need = !RT.ok || age > (active || uiOpen.explorer || uiOpen.spawn || uiOpen.scan ? 4000 : 15000);
 if (need) await RT.refresh(false);
 }
 setInterval(() => { bootTick().catch((e) => dlog("boot: " + e)); }, 1000);
@@ -1529,7 +1529,7 @@ place();
 const statDot = el("div", { className: "d" }), statTxt = el("span", { textContent: "starting..." });
 const stat = el("div", { className: "stat" }, [statDot, statTxt, ibtn("refresh", () => { if (RT && RT.ok) RT.refresh(false); say("refreshing objects"); }, "refresh the object list")]);
 const minBtn = el("button", { className: "hb", title: "minimize" }, [icon("min", 14)]);
-const head = el("div", { className: "h" }, [el("div", { className: "logo" }, [icon("spawn", 18)]), el("div", { className: "ttl1" }, [D.createTextNode("Subway Surfers"), el("span", { className: "pro", textContent: "PRO" }), el("small", { textContent: "mod menu v7" })]), el("div", { className: "sp" }), minBtn]);
+const head = el("div", { className: "h" }, [el("div", { className: "logo" }, [icon("spawn", 18)]), el("div", { className: "ttl1" }, [D.createTextNode("Subway Surfers"), el("span", { className: "pro", textContent: "PRO" }), el("small", { textContent: "mod menu v8" })]), el("div", { className: "sp" }), minBtn]);
 
 // ===== SPAWN =====
 const chunkOut = el("div", { className: "tbl" }), chunkHead = el("div", { className: "note" });
@@ -1661,118 +1661,6 @@ R_(lbl("Add keys"), RR(num(() => incC.keys, (v) => { incC.keys = Math.round(v); 
 el("div", { className: "note", textContent: "Calls the game's own InventorySave.SetCoins / SetKeys and shows the amount before and after." })
 ], "dev");
 const pageDev = el("div", { className: "pg hide" }, [devCard, walletCard]);
-
-// ===== GUI =====
-const gui = { list: [], selected: null, busy: false };
-const guiList = el("div", { className: "tbl" }), guiSearch = el("input", { type: "text", className: "txt", placeholder: "search UI elements...", spellcheck: false });
-const guiPreviewBox = el("div", { style: "background:#111;border:1px solid #333;border-radius:8px;padding:10px;min-height:80px;display:flex;align-items:center;justify-content:center;overflow:hidden;margin-bottom:10px;" });
-const guiPreviewText = el("span", { style: "font-family:sans-serif;font-size:24px;font-weight:bold;color:#fff;" });
-guiPreviewBox.appendChild(guiPreviewText);
-const guiEditor = el("div", { style: "display:none;flex-direction:column;gap:10px;" });
-const guiTextIn = el("input", { className: "txt", placeholder: "Change Text...", spellcheck: false });
-const guiColorIn = el("input", { type: "color", style: "width:100%;height:30px;border:none;background:none;cursor:pointer;" });
-
-guiTextIn.oninput = () => {
-if (!gui.selected) return;
-try {
-const m = RT.findMethod(RT.rw(gui.selected), "set_text", 1);
-if (m) RT.invoke(m, gui.selected, [RT.newString(guiTextIn.value)]);
-guiPreviewText.textContent = guiTextIn.value;
-} catch (e) { say("Failed to set text"); }
-};
-guiColorIn.oninput = () => {
-if (!gui.selected) return;
-try {
-const hex = guiColorIn.value;
-const r = parseInt(hex.slice(1,3),16)/255, g = parseInt(hex.slice(3,5),16)/255, b = parseInt(hex.slice(5,7),16)/255;
-const m = RT.findMethod(RT.rw(gui.selected), "set_color", 1);
-if (m) RT.invoke(m, gui.selected, [[r,g,b,1]]);
-guiPreviewText.style.color = hex;
-} catch (e) { say("Failed to set color"); }
-};
-
-doc.addEventListener("keydown", (e) => {
-if (e.ctrlKey && e.key === "c" && gui.selected) {
-if (doc.activeElement.tagName === "INPUT") return;
-navigator.clipboard.writeText(guiTextIn.value);
-say("Copied text to clipboard");
-}
-});
-
-guiEditor.append(guiPreviewBox, guiTextIn, guiColorIn);
-
-function guiRender() {
-guiList.innerHTML = "";
-const q = guiSearch.value.trim().toLowerCase();
-gui.list.filter(x => !q || x.name.toLowerCase().includes(q)).slice(0, 100).forEach(item => {
-const r = el("div", { className: "tr", style: "cursor:pointer;" }, [
-el("div", { className: "nm", textContent: item.name }),
-el("div", { className: "ty", textContent: item.type })
-]);
-r.onclick = () => {
-gui.selected = item.obj;
-guiEditor.style.display = "flex";
-if (item.type === "Text" || item.type === "UILabel") {
-guiTextIn.disabled = false;
-try {
-const m = RT.findMethod(RT.rw(item.obj), "get_text", 0);
-const t = m ? RT.invokeF(m, item.obj, []) : "";
-guiTextIn.value = t;
-guiPreviewText.textContent = t;
-const cm = RT.findMethod(RT.rw(item.obj), "get_color", 0);
-const c = cm ? RT.invoke(cm, item.obj, []) : [1,1,1,1];
-const chex = "#" + [c[0],c[1],c[2]].map(x => Math.round(Math.max(0, Math.min(1, x))*255).toString(16).padStart(2,'0')).join("");
-guiColorIn.value = chex;
-guiPreviewText.style.color = chex;
-} catch(e) {}
-} else {
-guiTextIn.value = "[Image]";
-guiTextIn.disabled = true;
-guiPreviewText.textContent = "";
-guiPreviewBox.style.background = "#333";
-}
-};
-guiList.appendChild(r);
-});
-}
-guiSearch.addEventListener("input", () => guiRender());
-
-async function scanGUI() {
-    if (!RT || !RT.ok || gui.busy) return;
-    gui.busy = true;
-    say("Scanning UI...");
-    const classesToScan = ["UnityEngine.UI.Text", "UILabel", "UnityEngine.UI.Image"];
-    let found = [];
-    const getActive = RT.findMethod(RT.klassByName("UnityEngine.GameObject"), "get_activeInHierarchy", 0);
-    const getGo = RT.findMethod(RT.klassByName("UnityEngine.Component"), "get_gameObject", 0);
-
-    for (const cls of classesToScan) {
-        const objs = RT.liveAll(cls);
-        for (let i = 0; i < objs.length; i++) {
-            const obj = objs[i];
-            try {
-                const go = RT.invoke(getGo, obj, []);
-                if (!go) continue;
-                const isActive = RT.invokeF(getActive, go, []);
-                if (!isActive) continue;
-                const name = unityName(go) || "Unknown UI";
-                found.push({ obj, type: cls.split('.').pop(), name: name });
-            } catch(e) {}
-            if (i % 50 === 0) await new Promise(r => setTimeout(r, 0));
-        }
-    }
-    gui.list = found;
-    gui.busy = false;
-    say(`Found ${found.length} active UI elements`);
-    guiRender();
-}
-
-const scanGuiBtn = btn("Rescan UI", () => scanGUI(), "hot", "scan");
-
-const pageGui = el("div", { className: "pg hide" }, [
-card("Live GUI Scanner", [scanGuiBtn, el("div", { className: "note", textContent: "Auto-scans on boot. Only shows active UI elements. Press Ctrl+C to copy selected text." }), guiSearch, guiList], "paint"),
-card("GUI Editor", [guiEditor], "prefs")
-]);
 
 // ===== EXPLORER =====
 const ex = { view: "objects", cls: null, objs: [], obj: null, stack: [], locks: new Map() };
@@ -2030,18 +1918,17 @@ el("div", { className: "note", textContent: "Drag the header to move the panel a
 card("Log", [logOut, el("div", { className: "btns" }, [btn("Copy log", () => copyText(LOG.join("\n")), "", "copy")])], "list")
 ]);
 
-const TABS = [["Spawn", "spawn", pageSpawn], ["Scan", "scan", pageScan], ["GUI", "paint", pageGui], ["Dev", "dev", pageDev], ["Explore", "explorer", pageEx], ["Code", "console", pageCon], ["Save", "save", pageSave], ["Prefs", "prefs", pagePrefs]];
+const TABS = [["Spawn", "spawn", pageSpawn], ["Scan", "scan", pageScan], ["Dev", "dev", pageDev], ["Explore", "explorer", pageEx], ["Code", "console", pageCon], ["Save", "save", pageSave], ["Prefs", "prefs", pagePrefs]];
 const pill = el("div", { className: "pill" }); pill.style.width = "calc((100% - 6px) / " + TABS.length + ")";
 const tabEls = TABS.map(([name, ic], i) => { const t = el("div", { className: "tab" }, [icon(ic, 16), D.createTextNode(name)]); t.onclick = () => setTab(i); return t; });
 const setTab = (i) => {
 S.tab = i; persist();
-uiOpen.explorer = i === 4; uiOpen.spawn = i === 0; uiOpen.scan = i === 1; uiOpen.gui = i === 2;
+uiOpen.explorer = i === 3; uiOpen.spawn = i === 0; uiOpen.scan = i === 1;
 pill.style.transform = "translateX(" + (i * 100) + "%)";
 tabEls.forEach((t, j) => t.classList.toggle("on", j === i));
 TABS.forEach(([, , p], j) => p.classList.toggle("hide", j !== i));
 if (i === 0) { chunkRender(); pkRender(); }
-if (i === 4) { exClasses(); exRender(); if (ex.view === "classes") clsRender(); }
-if (i === 2) guiRender();
+if (i === 3) { exClasses(); exRender(); if (ex.view === "classes") clsRender(); }
 };
 BODY = el("div", { className: "b" }, TABS.map((t) => t[2]));
 const rs = el("div", { className: "rs", title: "drag to resize" });
@@ -2119,29 +2006,21 @@ if (HK.size) text += "  \u2022  " + HK.size + " hooked";
 stat.className = "stat " + state; statTxt.textContent = text;
 saveInfo.textContent = "engine save sync: " + SAVE.engine + "\nbackup files: " + SAVE.files + (SAVE.lastBackup ? "  (last " + new Date(SAVE.lastBackup).toLocaleTimeString() + ")" : "") + "\nrestored this session: " + SAVE.restored + (SAVE.err ? "\nnote: " + SAVE.err : "");
 if (S.tab === 6) logOut.textContent = LOG.slice(-60).join("\n");
-if (S.tab === 3 && RT && RT.ok) {
+if (S.tab === 2 && RT && RT.ok) {
 const f = RT.liveAll(DEVC)[0];
 devActiveSel.textContent = f ? "DebugSettings found (" + hex(f) + ")" : "DebugSettings does not exist yet, the game only creates it on demand. Switch a setting on twice to try creating it.";
 }
-if (S.tab === 4) exRows.forEach(([inp, f, a]) => { if (D.activeElement === inp) return; try { const s = VEC_SIZES[f.tn] ? (csFieldVal(a, f) || []).join(",") : (f.enumTi >= 0 ? String(RT.read(a, f)) : RT.show(a, f)); if (inp.value !== s) inp.value = s; } catch (e) {} });
+if (S.tab === 3) exRows.forEach(([inp, f, a]) => { if (D.activeElement === inp) return; try { const s = VEC_SIZES[f.tn] ? (csFieldVal(a, f) || []).join(",") : (f.enumTi >= 0 ? String(RT.read(a, f)) : RT.show(a, f)); if (inp.value !== s) inp.value = s; } catch (e) {} });
 }, 600);
 setInterval(() => { ex.locks.forEach((L) => { try { RT.write(L.a, L.f, L.v); } catch (e) {} }); }, 100);
 
-// Auto-scan UI once connected
-const uiCheck = setInterval(() => {
-    if (RT && RT.ok) {
-        clearInterval(uiCheck);
-        scanGUI();
-    }
-}, 2000);
-
 applyLook(); drawMacros(); setSub("objects");
 setTab(S.tab >= 0 && S.tab < TABS.length ? S.tab : 0);
-dlog("Subway Surfers mod v7 ready");
+dlog("Subway Surfers mod v8 ready");
 }
 
 if (document.body) buildUI(); else addEventListener("DOMContentLoaded", buildUI);
 window.__ssRT = () => RT;
-dlog("Subway Surfers mod v7 loaded, dedicated GUI tab active");
+dlog("Subway Surfers mod v8 loaded, stable");
 
 })();
