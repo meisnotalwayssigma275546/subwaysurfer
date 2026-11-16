@@ -1,11 +1,4 @@
-/* Subway Surfers (Unity WebGL 2019.4, IL2CPP) mod, v2 (IL2CPP backend)
- * Auto-connects to the running game, no scans needed. The GUI is unchanged, the backend now talks to the game
- * through its own C# methods wherever the dump shows one:
- *  - Calls: real IL2CPP methods are invoked through the wasm function table (strings, structs, 64-bit, enums).
- *  - Hooks: wasm table trampolines for virtual/interface/delegate calls (counted, so you can see if they fire).
- *  - Spawn: SetSpawnPointForced / SpawnPickup / BuildRandomlyOrderedPrefabList(SyboRandom), not just field writes.
- *  - Developer: DebugSettings static setters.  Wallet: InventorySave.IncreaseCoins(int, string).
- *  - Code tab: a live C# style invoker/patcher (Class.Method(args), obj.field = v, hook / patch / hold).
+/* Subway Surfers (Unity WebGL 2019.4, IL2CPP) mod, v3
  * Load it in index.html BEFORE master-loader.js:   <script src="ss_mod_v2.js"></script>
  */
 (function () {
@@ -20,8 +13,7 @@ const lsSet = (k, v) => { try { localStorage.setItem(k, v); return true; } catch
 const getModule = () => { const g = window.unityGame; return (g && g.Module) || window.UnityModule || null; };
 
 // ===================================================================================================
-// SAVE SYSTEM. The engine only syncs /idbfs (PlayerPrefs, Save/local, ...) to IndexedDB when Module.indexedDB
-// is truthy, and nothing in the framework sets it, so nothing persisted. This sets it, and keeps a backup copy.
+// SAVE SYSTEM.
 // ===================================================================================================
 const SAVE = { engine: "waiting", lastBackup: 0, files: 0, restored: 0, err: "" };
 const MIRROR = "ssmod_save_mirror_v1";
@@ -94,7 +86,60 @@ addEventListener("pagehide", engineTick);
 document.addEventListener("visibilitychange", () => { if (document.hidden) { engineTick(); saveBackup(); } });
 
 // ===================================================================================================
-// RUNTIME: reads the game's memory using the IL2CPP metadata that sits in the heap
+// MEMORY SCANNER: works on the raw wasm heap, independent of the IL2CPP runtime
+// ===================================================================================================
+const MS = { prev: [], type: "int32", busy: false };
+const msStep = (t) => t === "int8" ? 1 : t === "int16" ? 2 : t === "double" ? 8 : 4;
+const msReadDV = (dv, a, t) => {
+switch (t) {
+case "int32": return dv.getInt32(a, true);
+case "uint32": return dv.getUint32(a, true);
+case "float": return dv.getFloat32(a, true);
+case "double": return dv.getFloat64(a, true);
+case "int16": return dv.getInt16(a, true);
+case "int8": return dv.getInt8(a);
+}
+return NaN;
+};
+const msWriteDV = (dv, a, t, v) => {
+switch (t) {
+case "int32": dv.setInt32(a, v | 0, true); break;
+case "uint32": dv.setUint32(a, v >>> 0, true); break;
+case "float": dv.setFloat32(a, +v, true); break;
+case "double": dv.setFloat64(a, +v, true); break;
+case "int16": dv.setInt16(a, v, true); break;
+case "int8": dv.setInt8(a, v); break;
+}
+};
+function msRead(addr, t) { const M = getModule(); return M ? msReadDV(new DataView(M.HEAPU8.buffer), addr >>> 0, t) : NaN; }
+function msWrite(addr, t, v) { const M = getModule(); if (M) msWriteDV(new DataView(M.HEAPU8.buffer), addr >>> 0, t, v); }
+function msScanSync(t, v) {
+const M = getModule(); if (!M) throw new Error("game module not loaded yet");
+const dv = new DataView(M.HEAPU8.buffer), n = M.HEAPU8.length, s = msStep(t), out = [];
+for (let a = s; a < n - s; a += s) { if (msReadDV(dv, a, t) === v) out.push(a); if (out.length > 200000) break; }
+return out;
+}
+async function msFirstScan(t, v, cb) {
+const M = getModule(); if (!M) throw new Error("game module not loaded yet");
+const dv = new DataView(M.HEAPU8.buffer), n = M.HEAPU8.length, s = msStep(t), out = [];
+const CH = 1 << 22;
+for (let a = s; a < n - s; a += CH) {
+const e = Math.min(n - s, a + CH);
+for (let i = a; i < e; i += s) if (msReadDV(dv, i, t) === v) out.push(i);
+if (cb) cb(Math.min(1, e / n));
+await new Promise(r => setTimeout(r, 0));
+if (out.length > 200000) break;
+}
+return out;
+}
+function msNextScan(t, v, prev) {
+const M = getModule(); if (!M) return [];
+const dv = new DataView(M.HEAPU8.buffer);
+return prev.filter(a => msReadDV(dv, a, t) === v);
+}
+
+// ===================================================================================================
+// RUNTIME.
 // <RT>
 function makeRT(M, log) {
 const R = { M, ok: false, status: "idle", L: {}, meta: null, klassOf: new Map(), kinv: new Map(), objs: new Map(), lastScan: 0, cache: new Map(), enums: new Map(), mcache: new Map(), cycles: 0, strCache: new Map(), subCache: new Map() };
@@ -164,7 +209,6 @@ return out;
 return m;
 };
 
-// class index: the runtime Il2CppClass for every metadata type
 R.scanClasses = async () => {
 const m = R.meta, lo = m.base + m.str[0], hi = lo + m.str[1];
 const want = new Map();
@@ -232,7 +276,6 @@ R.ok = !!(L.fields && L.fstride && L.td >= 0 && tf[1] >= 3);
 return R.ok;
 };
 
-// objects: every instance of every known class, one sliced pass
 R.scanObjects = async () => {
 if (!R.ok) throw new Error("not connected");
 const kmap = R.kinv; let lo = 1e12, hi = 0;
@@ -369,10 +412,8 @@ const out = [];
 for (let i = 0; i < n && i < 3000; i++) out.push(rw(arr + 16 + i * 4));
 return out;
 };
-// element i of a managed reference array (T[]): length at +12, items from +16
 R.arrayItems = (arr) => { if (!inHeap(arr)) return []; const n = Math.min(rw(arr + 12), 4000), out = []; for (let i = 0; i < n; i++) out.push(rw(arr + 16 + i * 4)); return out; };
 
-// methods
 R.methodsOfKlass = (k) => {
 const hit = R.mcache.get(k); if (hit) return hit;
 const L = R.L; if (!L.methods) return [];
@@ -389,12 +430,9 @@ return out;
 };
 R.methodsChain = (k) => { const out = []; let kk = k, g = 0; while (kk && inHeap(kk) && g++ < 14) { for (const m of R.methodsOfKlass(kk)) out.push(m); kk = R.L.parent ? rw(kk + R.L.parent) : 0; } return out; };
 R.findMethod = (k, name, argc) => R.methodsChain(k).find((m) => m.name === name && m.pars.length === argc) || null;
-// the method record for a MethodInfo*, like il2cpp_method_get_... (MethodInfo+12 is its class)
 R.methodByMI = (mi) => { const k = rw(mi + 12); if (!inHeap(k)) return null; return R.methodsOfKlass(k).find((x) => x.mi === mi) || null; };
 
-// ---- subclasses and class lookup ----
 R.klassByName = (full) => { const l = R.cls(full); return l ? ((R.klassOf.get(l[0]) || [])[0] || 0) : 0; };
-// every metadata type whose runtime class is, or derives from, the given class types (generic bases included)
 R.typesByShort = (short) => { const out = []; for (const [k, l] of R.meta.byName) if (k.slice(k.lastIndexOf(".") + 1) === short) for (const ti of l) out.push(ti); return out; };
 R.subTypesOf = (base, key) => {
 const ck = key + "#" + R.kinv.size;
@@ -411,16 +449,13 @@ const arr = Array.from(out); R.subCache.set(ck, arr); return arr;
 R.subTypes = (full) => R.subTypesOf(R.cls(full) || [], full);
 R.findAll = (full) => { let out = []; for (const ti of R.subTypes(full)) out = out.concat(R.objs.get(ti) || []); return out; };
 
-// ---- liveness: the object scan also sees freed memory, so never call into an object that Unity has destroyed ----
 R.isLive = (obj) => { const f = R.fieldOf(obj, "m_CachedPtr"); if (!f) return true; return R.read(obj, f) !== 0; };
 R.liveAll = (full) => R.findAll(full).filter((o) => { try { return R.isLive(o); } catch (e) { return false; } });
-// the game's own singleton: its static instance field if it has one, otherwise the first live object
 R.singleton = (full) => {
 const k = R.klassByName(full); if (!k) return 0;
 for (const f of R.klassFields(k)) if (f.isStatic && /^(_?instance|s_?instance)$/i.test(f.name)) { try { const v = R.read(0, f); if (v && inHeap(v >>> 0) && R.klassName(rw(v >>> 0))) return v >>> 0; } catch (e) {} }
 return R.liveAll(full)[0] || 0;
 };
-// turn whatever a failed call threw into a readable message
 R.explain = (e) => {
 if (typeof e === "number") {
 const p = e >>> 0, i = inHeap(p) ? R.inspect(p) : null;
@@ -438,7 +473,6 @@ const M2 = { "System.Int32": "int", "System.Single": "float", "System.Double": "
 if (!n) return "object"; if (M2[n]) return M2[n];
 return n.slice(n.lastIndexOf(".") + 1).replace(/`\d+$/, "");
 };
-// a read-only C# view of a class built from the metadata (bodies are compiled to native code, so they cannot be shown)
 R.classSource = (ti) => {
 const m = R.meta, t = m.T[ti], full = m.name(ti), sh = R.shortType;
 const k = (R.klassOf.get(ti) || [])[0] || 0;
@@ -473,7 +507,6 @@ L.push("}");
 return L.join("\n");
 };
 
-// ---- calls: through the wasm function table, the same entry the game's own indirect calls use ----
 const PRIM = new Set(["System.Int32", "System.UInt32", "System.Int16", "System.UInt16", "System.Byte", "System.SByte", "System.Boolean", "System.Char", "System.IntPtr", "System.UIntPtr"]);
 const STRUCT = { "UnityEngine.Vector3": 3, "UnityEngine.Vector2": 2, "UnityEngine.Quaternion": 4, "UnityEngine.Color": 4, "UnityEngine.Vector4": 4 };
 R.STRUCT = STRUCT;
@@ -481,7 +514,6 @@ R.table = () => {
 const c = [M.wasmTable, M.asm && M.asm.__indirect_function_table, M.asm && M.asm.table, M.asm && M.asm.__table, typeof window !== "undefined" && window.__ssEarly && window.__ssEarly.table];
 return c.find((t) => t && typeof t.get === "function") || null;
 };
-// wasm value class of a C# type name: i f d j, v (void), S (known struct, passed by pointer) or null (unsupported struct)
 R.wtype = (name) => {
 if (!name || name === "?") return "i";
 if (name === "System.Void") return "v";
@@ -495,7 +527,6 @@ if (l) { const t = R.meta.T[l[0]], p = t.parent >= 0 ? R.meta.byval.get(t.parent
 return "i";
 };
 R.isPtrType = (name) => { if (!name || name === "?") return true; if (PRIM.has(name) || R.wtype(name) !== "i") return false; const l = R.meta.byName.get(name); return !(l && R.meta.isEnum(l[0])); };
-// a managed string the game can read: String class pointer, no monitor, length, UTF-16 chars (never freed, the game may keep it)
 R.newString = (s) => {
 s = String(s);
 let p = R.strCache.get(s); if (p) return p;
@@ -509,7 +540,6 @@ if (R.strCache.size > 800) R.strCache.clear();
 R.strCache.set(s, p);
 return p;
 };
-// call method record m with (this, args). args: numbers, booleans, JS strings (for String parameters), float arrays (for Vector3 etc.), BigInt/numbers for 64-bit
 R.invoke = (m, thisPtr, args) => {
 args = args || [];
 if (m.pars.length !== args.length) throw new Error(m.name + " needs " + m.pars.length + " argument(s)");
@@ -555,7 +585,6 @@ return r;
 } finally { bufs.forEach((b) => M._free(b)); }
 };
 R.call = (m, thisPtr, args) => R.invoke(m, thisPtr, args);
-// the same, but results come back as friendly JS values (bool, string, unsigned pointer)
 R.invokeF = (m, thisPtr, args) => {
 const r = R.invoke(m, thisPtr, args);
 if (Array.isArray(r) || r === undefined) return r;
@@ -565,7 +594,6 @@ if (m.ret === "System.String") { const s = R.readStr(r >>> 0); return s === null
 if (R.isPtrType(m.ret)) return r >>> 0;
 return r;
 };
-// il2cpp_runtime_invoke, in spirit: a MethodInfo*, an object (0 for static) and the arguments
 R.runtimeInvoke = (mi, obj, args) => { const m = R.methodByMI(mi); if (!m) throw new Error("no method for MethodInfo " + hex(mi)); return R.invokeF(m, obj || 0, args || []); };
 R.staticCall = (full, name, args) => {
 const k0 = R.cls(full); if (!k0) throw new Error("no class " + full);
@@ -586,7 +614,6 @@ if (!R.isPtrType(m.ret)) return String(v);
 return v ? hex(v) : "null";
 };
 
-// connect and refresh
 R.refresh = async (full) => {
 if (R.refreshing) return;
 R.refreshing = true;
@@ -621,12 +648,19 @@ return R;
 // ===================================================================================================
 
 let RT = null;
+// Clamp S to the current viewport so a bad saved position never hides the panel.
+const viewW = () => (typeof innerWidth === "number" && innerWidth) || 1024;
+const viewH = () => (typeof innerHeight === "number" && innerHeight) || 768;
 const S = Object.assign({ w: 390, h: 600, zoom: 100, ui: 100, theme: "Gold", toasts: true, tab: 0, vals: {}, macros: [], min: false, x: 12, y: 12 }, (() => { try { return JSON.parse(lsGet("ssmod_settings_v2")) || {}; } catch (e) { return {}; } })());
+S.x = Math.max(8, Math.min(viewW() - 80, S.x));
+S.y = Math.max(8, Math.min(viewH() - 60, S.y));
+S.w = Math.max(300, Math.min(1000, S.w));
+S.h = Math.max(240, Math.min(viewH() - 20, S.h));
 const persist = () => lsSet("ssmod_settings_v2", JSON.stringify(S));
 let toast = null;
 const say = (s) => { dlog(s); if (toast) toast(s); };
 
-// ---------- overrides: write a value, remember the original, restore it when switched off ----------
+// ---------- overrides ----------
 const OV = new Map();
 const GROUPS = new Map();
 const ovKey = (obj, f) => obj + ":" + f.owner + "." + f.name;
@@ -672,16 +706,13 @@ ovApply();
 }
 setInterval(runGroups, 200);
 
-// helper: fields of every live object of a class
 function eachField(cls, fname, cb) {
 if (!RT || !RT.ok) return;
 for (const obj of RT.find(cls)) { try { const f = RT.fieldOf(obj, fname); if (f) cb(obj, f); } catch (e) {} }
 }
 
 // ===================================================================================================
-// HOOK ENGINE: swaps a wasm function table entry for a tiny wasm trampoline that calls JS first.
-// Only INDIRECT calls (virtual, interface, delegates, runtime_invoke) pass through the table. Direct calls compiled
-// into the wasm cannot be intercepted from JS, so every hook counts its hits and the Code tab lists them.
+// HOOK ENGINE
 // ===================================================================================================
 const VT = { i: 0x7f, j: 0x7e, f: 0x7d, d: 0x7c };
 function buildTramp(sig, js) {
@@ -712,7 +743,6 @@ const HK = new Map();
 let hookId = 0;
 function unhookRec(r) { const t = RT && RT.table(); try { if (t) t.set(r.fn, r.orig); } catch (e) {} HK.delete(r.fn); }
 function hookMethod(cls, name, argc, make, label) { return hookFound(findOwn(cls, name, argc | 0), make, label); }
-// like findOwn, but also finds a method inherited from a base class (returns the declaring class)
 function findChain(cls, name, argc) {
 if (!RT || !RT.ok) throw new Error("not connected yet");
 const k0 = RT.klassByName(cls); if (!k0) throw new Error("no class " + cls);
@@ -731,7 +761,7 @@ const rec = { id: ++hookId, label: label || (cls + "." + name), cls, name, fn: f
 const rc = sig[0];
 const js = function () {
 const a = Array.prototype.slice.call(arguments);
-if (!rec.isStatic) { const k = RT.rw(a[0] >>> 0); if (!(k && RT.isSub(k, rec.klass))) { rec.skipped++; return orig.apply(null, a); } } // shared code (folded identical methods): not ours
+if (!rec.isStatic) { const k = RT.rw(a[0] >>> 0); if (!(k && RT.isSub(k, rec.klass))) { rec.skipped++; return orig.apply(null, a); } }
 rec.hits++;
 try { return hcoerce(rc, make(a, orig, rec)); } catch (e) { rec.err = String(e && e.message || e); return orig.apply(null, a); }
 };
@@ -779,7 +809,6 @@ return gp ? RT.invoke(gp, tr, []) : null;
 }
 
 // ---------- run state, names ----------
-// true while a run is active: Game.IsInGame is a Variable<bool>
 function inRun() {
 if (!RT || !RT.ok) return false;
 const g = RT.singleton("SYBO.Subway.Game"); if (!g) return false;
@@ -798,7 +827,6 @@ const r = RT.invokeF(m, p, []); return typeof r === "string" ? r : null;
 } catch (e) { return null; }
 }
 let nameCache = { t: 0, list: [] };
-// every live GameObject with its Unity name (cached for a few seconds)
 function objectNames(force) {
 if (!RT || !RT.ok) return [];
 if (!force && Date.now() - nameCache.t < 5000) return nameCache.list;
@@ -815,8 +843,6 @@ return hit;
 }
 
 // ---------- chunk weights ----------
-// The picks come from cached lists (_randomlyOrderedPrefabs, _weightedRandomizedPrefabs) that are built from the weights, so after
-// the weights change the game's own BuildRandomlyOrderedPrefabList(SyboRandom) has to run (only while a run is active).
 const C_CONT = "SYBO.Subway.Routes.WeightRandomizedPrefabContainter`2";
 const C_RANDOM = "SYBO.Common.Utilities.SyboRandom";
 function entryName(e, nm) {
@@ -842,7 +868,6 @@ entries.forEach((e) => seen.add(e.addr));
 if (entries.length) out.push({ addr: c, name: name || "(unnamed)", entries });
 } catch (e) { /* skip */ }
 }
-// weighted entries that no container list reached (grouped by their class), so chunk names are always listed when they exist in memory
 try {
 const groups = new Map();
 for (const ti of RT.subTypesOf(RT.typesByShort("WeightedPrefab`1"), "WeightedPrefab`1")) for (const o of (RT.objs.get(ti) || [])) {
@@ -890,8 +915,6 @@ const NSP = "SYBO.Subway.Pickups.";
 const P_DATA = NSP + "PickupData", P_SPOT = NSP + "PickupSpawnPoint", P_TYPE = NSP + "PickupType", P_MODE = NSP + "SpawnPointMode", P_MGR = NSP + "PickupManager", P_PICKER = NSP + "Pickers.PickerData", P_BASE = NSP + "Picker.Pickers.BasePicker";
 const pk = { force: "JetPack" };
 function pickupTypeValue(name) { const e = RT && RT.ok ? RT.enumOf(P_TYPE).find((x) => x.name === name) : null; return e ? e.value : 0; }
-// Only plain number writes here. Calling SetSpawnPointForced / SpawnPickup from outside, or widening enums, made the game throw inside its own
-// update loop, so the flood now just turns the spawn knobs all the way up and forces the type at every spawn point.
 defGroup("force", () => {
 const out = [], mode = RT.enumOf(P_MODE).find((x) => x.name === "WillForcePickupType"), val = pickupTypeValue(pk.force);
 if (!mode || !val) return out;
@@ -911,7 +934,7 @@ try {
 const fT = RT.fieldOf(o, "_pickupType"), fP = RT.fieldOf(o, "_probabilityToSpawn"), fD = RT.fieldOf(o, "_spawnDistanceMinToPrevious");
 if (fP) out.push([o, fP, 1]);
 if (fD) out.push([o, fD, 0]);
-if (fT) out.push([o, fT, (RT.read(o, fT) | tv) | 0]); // PickupType is a flags mask
+if (fT) out.push([o, fT, (RT.read(o, fT) | tv) | 0]);
 } catch (e) {}
 }
 for (const o of RT.find(P_DATA)) {
@@ -954,9 +977,7 @@ const TUNE = [
 ];
 TUNE.forEach((t) => { if (S.vals[t.id] === undefined) S.vals[t.id] = t.def; defGroup(t.id, () => { const out = []; for (const [c, f] of t.cls) eachField(c, f, (o, fl) => out.push([o, fl, S.vals[t.id]])); return out; }); });
 
-// ---------- developer settings (the developers' own DebugSettings singleton) ----------
-// The game only creates DebugSettings when something asks for its instance, so in a normal run it does not exist.
-// The first switch tells you so; switching again asks the game for its instance (may abort if the prefab is missing).
+// ---------- developer settings ----------
 const DEVC = "SYBO.Subway.Utilities.DebugSettings";
 let devArmed = false;
 function devEnsure() {
@@ -982,7 +1003,7 @@ const liveDev = (cb) => { for (const o of RT.liveAll(DEVC)) { try { const f = RT
 DEV.forEach((d) => defGroup("dev" + d.f, () => { const out = []; liveDev({ f: d.f, fn: (o, f) => out.push([o, f, f.kind === "bool" ? true : 1]) }); return out; }, null, devEnsure));
 defGroup("dev_active", () => { const out = []; liveDev({ f: "_active", fn: (o, f) => out.push([o, f, f.kind === "bool" ? true : (S.vals.devActive || 1)]) }); return out; }, null, devEnsure);
 
-// ---------- wallet: the game's own static SetCoins/SetKeys (IncreaseCoins fires analytics and listeners that abort in this build) ----------
+// ---------- wallet ----------
 const INV = "Data.Save.InventorySave";
 function walletAdd(kind, n) {
 if (!RT || !RT.ok) throw new Error("not connected yet");
@@ -993,12 +1014,12 @@ RT.staticCall(INV, set, [Math.max(0, Math.min(2000000000, before + Math.round(n)
 return before + " -> " + (RT.staticCall(INV, get, []) | 0);
 }
 
-// ---------- safety net: if the game aborts, let go of everything we were holding ----------
+// ---------- safety net ----------
 function releaseAll() { try { GROUPS.forEach((g) => { g.on = false; }); ovRelease("*"); HOOKS.off(); } catch (e) {} }
 addEventListener("error", (ev) => { const msg = String(ev && ev.message || ""); if (/abort\(/.test(msg) && (OV.size || HK.size)) { releaseAll(); dlog("the game aborted, all mod writes and hooks were released"); } });
 
-// ---------- boot: connect automatically and keep the object list fresh ----------
-let uiOpen = { explorer: false, spawn: false };
+// ---------- boot ----------
+let uiOpen = { explorer: false, spawn: false, scan: false };
 async function bootTick() {
 const M = getModule();
 if (!M || !M.HEAPU8 || !M.asm) { if (!RT) return; return; }
@@ -1006,22 +1027,18 @@ if (!RT) RT = makeRT(M, dlog);
 if (!RT.connected) { await RT.connect(); return; }
 const active = GROUPS.size && Array.from(GROUPS.values()).some((g) => g.on) || OV.size > 0;
 const age = Date.now() - RT.lastScan;
-const need = !RT.ok || age > (active || uiOpen.explorer || uiOpen.spawn ? 4000 : 15000);
+const need = !RT.ok || age > (active || uiOpen.explorer || uiOpen.spawn || uiOpen.scan ? 4000 : 15000);
 if (need) await RT.refresh(false);
 }
 setInterval(() => { bootTick().catch((e) => dlog("boot: " + e)); }, 1000);
 
 // ===================================================================================================
-// CODE TAB ENGINE: a C# subset (lexer + parser + interpreter) over the live IL2CPP runtime, and a translator to
-// frida-il2cpp-bridge JavaScript. Supported: var/typed declarations, if/else, while, for, foreach, blocks, break/continue/return,
-// operators, ?:, ??, casts, $"strings", Class.Method(args), obj.Prop, obj.field = v, new Vector3(...), arrays/lists, find("Name"),
-// plus the commands hook / patch / unhook / hold / release / hooks / print / help.
+// CODE TAB ENGINE
 // ===================================================================================================
 class Ptr { constructor(v) { this.v = v >>> 0; } }
 const CS_PRIM = new Set(["var", "int", "float", "double", "bool", "string", "long", "uint", "object", "short", "byte", "char", "ulong", "decimal", "sbyte", "ushort"]);
 const CS_CMD = new Set(["hook", "patch", "unhook", "hold", "release", "hooks", "help"]);
 
-// ---------- lexer ----------
 function csLex(src) {
 const toks = []; let i = 0, line = 1; const n = src.length;
 const push = (t, v, st, x) => toks.push(Object.assign({ t, v, line, pos: st, end: i }, x || {}));
@@ -1055,7 +1072,6 @@ toks.push({ t: "eof", v: "", line, pos: n, end: n });
 return toks;
 }
 
-// ---------- parser ----------
 class CsParser {
 constructor(src) { this.src = src; this.toks = csLex(src); this.p = 0; }
 get tk() { return this.toks[this.p]; }
@@ -1068,7 +1084,6 @@ needOp(v) { if (!this.eatOp(v)) this.err("expected '" + v + "' but found '" + (t
 endStmt() { if (this.eatOp(";")) return; const t = this.tk, prev = this.toks[this.p - 1]; if (t.t === "eof" || this.isOp("}") || (prev && t.line > prev.line)) return; this.err("expected ';' but found '" + t.v + "'"); }
 program() { const out = []; while (this.tk.t !== "eof") out.push(this.stmt()); return out; }
 block() { this.needOp("{"); const b = []; while (!this.isOp("}")) { if (this.tk.t === "eof") this.err("missing '}'"); b.push(this.stmt()); } this.needOp("}"); return { k: "block", b }; }
-// does a declaration start here: Type name = / Type name ;
 looksLikeDecl() {
 let o = 0;
 if (!this.isId(undefined, o)) return false;
@@ -1107,7 +1122,6 @@ const name = this.tk.v, line = this.tk.line; this.p++;
 if (name === "hooks" || name === "release" || name === "help") { this.endStmt(); return { k: "cmd", name }; }
 if (name === "hold") { const e = this.expr(); this.endStmt(); return { k: "cmd", name, e }; }
 if (name === "unhook") { if (this.isId("all")) { this.p++; this.endStmt(); return { k: "cmd", name, all: true }; } const target = this.target(); this.endStmt(); return { k: "cmd", name, target }; }
-// hook / patch: Class.Method(n) => rest of the line
 const target = this.target();
 let body = null, nop = false;
 if (name === "patch" && this.isId("nop")) { this.p++; nop = true; }
@@ -1146,7 +1160,7 @@ for (;;) {
 if (this.isOp(".") || this.isOp("?.")) { this.p++; const t = this.tk; if (t.t !== "id") this.err("expected a name after '.'"); this.p++; let ga = null; if (this.isOp("<") && this.genericCall()) ga = this.genericArgs(); e = { k: "mem", o: e, n: t.v, ga }; }
 else if (this.isOp("(")) { this.p++; const a = []; if (!this.isOp(")")) { do { a.push(this.expr()); } while (this.eatOp(",")); } this.needOp(")"); e = { k: "call", f: e, a }; }
 else if (this.isOp("[")) { this.p++; const i = this.expr(); this.needOp("]"); e = { k: "idx", o: e, i }; }
-else if ((this.isOp("++") || this.isOp("--")) ) { const op = this.tk.v; this.p++; e = { k: "post", op, e }; }
+else if ((this.isOp("++") || this.isOp("--"))) { const op = this.tk.v; this.p++; e = { k: "post", op, e }; }
 else break;
 }
 return e;
@@ -1169,7 +1183,6 @@ this.err("unexpected '" + (t.v || "end of code") + "'");
 }
 }
 
-// ---------- interpreter ----------
 const csGlobals = new Map();
 class Scope { constructor(parent) { this.vars = new Map(); this.parent = parent || null; } find(n) { for (let s = this; s; s = s.parent) if (s.vars.has(n)) return s; return null; } }
 const isNil = (v) => v === null || v === undefined || (v instanceof Ptr && !v.v);
@@ -1215,7 +1228,16 @@ function csCall(cands, thisPtr, args, what) {
 const m = csPick(cands, args); if (!m) throw new Error("no " + what + " taking " + args.length + " argument(s)");
 return csPtrOrVal(RT.invokeF(m, m.static ? 0 : thisPtr, csConv(m, args)), m.ret);
 }
+const VEC_SIZES = { "UnityEngine.Vector2": 2, "UnityEngine.Vector3": 3, "UnityEngine.Vector4": 4, "UnityEngine.Quaternion": 4, "UnityEngine.Color": 4 };
 function csFieldVal(obj, f) {
+if (VEC_SIZES[f.tn]) {
+try {
+const a = RT.fieldAddr(obj, f); if (!a) return null;
+const dv = new DataView(RT.M.HEAPU8.buffer), n = VEC_SIZES[f.tn], out = [];
+for (let i = 0; i < n; i++) out.push(dv.getFloat32(a + i * 4, true));
+return out;
+} catch (e) { return null; }
+}
 const v = RT.read(obj, f);
 if (f.kind === "string") { const s = RT.readStr(v); return s === null ? (v ? new Ptr(v) : null) : s; }
 if (["object", "array", "generic", "T", "ptr"].indexOf(f.kind) >= 0) return v ? new Ptr(v) : null;
@@ -1223,6 +1245,13 @@ return v;
 }
 function csSetField(obj, f, v) {
 v = csArg(v);
+if (Array.isArray(v) && VEC_SIZES[f.tn]) {
+const a = RT.fieldAddr(obj, f);
+if (!a) throw new Error("no address for " + f.name);
+const dv = new DataView(RT.M.HEAPU8.buffer), n = Math.min(v.length, VEC_SIZES[f.tn]);
+for (let i = 0; i < n; i++) dv.setFloat32(a + i * 4, +v[i], true);
+return;
+}
 if (typeof v === "string") { if (f.kind === "string") v = RT.newString(v); else if (f.enumTi >= 0) { const e = RT.meta.enumMembers(f.enumTi).find((x) => x.name === v); if (!e) throw new Error("no enum value " + v); v = e.value; } else throw new Error("cannot store a string in " + f.tn); }
 if (v === null) v = 0;
 RT.write(obj, f, v);
@@ -1319,7 +1348,67 @@ throw new Error("cannot call ." + name + " on " + csFmt(o));
 }
 const csFmtPlain = (v) => (typeof v === "string" ? v : csFmt(v));
 const CSB = {
-find: (a) => { const x = csArg(a[0]); if (typeof x !== "string") return a[0]; const c = csClass(x); if (c) { const o = RT.singleton(c); if (o) return new Ptr(o); } const h = findByName(x)[0]; return h ? new Ptr(h.ptr) : null; },
+find: (a) => {
+const x = csArg(a[0]);
+if (typeof x !== "string") return a[0];
+if (!RT || !RT.ok) return null;
+const name = x;
+const c = csClass(name);
+if (c) { const o = RT.singleton(c); if (o) return new Ptr(o); const live = RT.liveAll(c); if (live.length) return new Ptr(live[0]); }
+let hits = findByName(name);
+if (!hits.length) { try { objectNames(true); } catch (e) {} hits = findByName(name); }
+if (hits.length) return new Ptr(hits[0].ptr);
+const short = name.slice(name.lastIndexOf(".") + 1).toLowerCase();
+for (const [full, tis] of (RT.meta ? RT.meta.byName : [])) {
+const s = full.slice(full.lastIndexOf(".") + 1).replace(/`\d+$/, "").toLowerCase();
+if (s !== short) continue;
+for (const ti of tis) { const l = RT.objs.get(ti); if (l && l.length) return new Ptr(l[0]); }
+}
+return null;
+},
+player: (a) => {
+if (!RT || !RT.ok) return null;
+const g = RT.singleton("SYBO.Subway.Game");
+if (g) { const info = RT.inspect(g); if (info) for (const f of info.fields) { if (f.isStatic || !/player|character|avatar/i.test(f.name)) continue; try { const v = RT.read(g, f) >>> 0; if (v && RT.inHeap(v) && RT.inspect(v)) return new Ptr(v); } catch (e) {} } }
+for (const n of ["Player", "Character", "Jake"]) { const h = findByName(n)[0]; if (h) return new Ptr(h.ptr); }
+for (const [full, tis] of (RT.meta ? RT.meta.byName : [])) {
+if (!/Player|Character/i.test(full)) continue;
+for (const ti of tis) { const l = RT.objs.get(ti); if (l && l.length) return new Ptr(l[0]); }
+}
+return null;
+},
+objects: (a) => {
+if (!RT || !RT.ok) return "not connected";
+const q = a[0] ? String(csArg(a[0])).toLowerCase() : "";
+return objectNames(true).filter((o) => !q || o.name.toLowerCase().includes(q)).slice(0, 200).map((o) => "0x" + o.ptr.toString(16).padStart(8, "0") + "  " + o.name);
+},
+classes: (a) => {
+if (!RT || !RT.ok) return "not connected";
+const q = a[0] ? String(csArg(a[0])).toLowerCase() : "", out = [];
+for (const [full, tis] of (RT.meta ? RT.meta.byName : [])) {
+if (q && !full.toLowerCase().includes(q)) continue;
+const live = tis.reduce((n, ti) => n + ((RT.objs.get(ti) || []).length), 0);
+out.push(full + (live ? "  [" + live + " live]" : ""));
+if (out.length >= 400) break;
+}
+return out;
+},
+diag: () => {
+const M = getModule();
+return [
+"module: " + (M ? "yes (" + (M.HEAPU8.length / 1048576).toFixed(0) + " MB)" : "no"),
+"RT: " + (RT ? (RT.connected ? "connected" : "not connected") : "null"),
+"RT.ok: " + (RT ? !!RT.ok : false),
+"RT.status: " + (RT ? RT.status : "n/a"),
+"classes indexed: " + (RT && RT.kinv ? RT.kinv.size : 0),
+"objects scanned: " + ((RT && RT.total) || 0),
+"names cached: " + (nameCache.list ? nameCache.list.length : 0),
+"layout: " + JSON.stringify((RT && RT.L) || null)
+].join("\n");
+},
+scanFirst: (a) => msScanSync(String(a[1] ? csArg(a[1]) : "int32"), +csArg(a[0])),
+scanNext: (a) => { const t = String(a[1] ? csArg(a[1]) : "int32"), v = +csArg(a[0]); const prev = Array.isArray(a[2]) ? csArg(a[2]) : MS.prev; return msNextScan(t, v, prev); },
+scanWrite: (a) => { msWrite(csArg(a[0]) >>> 0, String(a[2] ? csArg(a[2]) : "int32"), +csArg(a[1])); return "ok"; },
 findAll: (a) => { const x = String(csArg(a[0])); const c = csClass(x); if (c) { const l = RT.liveAll(c); if (l.length) return l.map((o) => new Ptr(o)); } return findByName(x).map((h) => new Ptr(h.ptr)); },
 findByName: (a) => { const h = findByName(String(csArg(a[0])))[0]; return h ? new Ptr(h.ptr) : null; },
 peek: (a) => RT.M.HEAPU32[csArg(a[0]) >>> 2], peekf: (a) => RT.M.HEAPF32[csArg(a[0]) >>> 2],
@@ -1420,7 +1509,7 @@ return { f: findChain(cls, name, argc), label: cls.split(".").pop() + "." + name
 }
 function csCommand(n, sc, out) {
 switch (n.name) {
-case "help": return "Real C# subset: var x = find(\"Jake\"); x.transform.localScale = new Vector3(2,2,2); if/while/for/foreach; Class.Method(args); hold o.f = v; release; hook C.M(n) => expr; patch C.M => value|nop; unhook C.M|all; hooks. Press To Frida JS to translate.";
+case "help": return "Real C# subset: var x = find(\"Jake\"); if (x != null) x.transform.localScale = new Vector3(2,2,2); player(); objects(\"jake\"); classes(\"player\"); diag(); scanFirst(1234); scanNext(1234, addrs); scanWrite(addr, 999); if/while/for/foreach; Class.Method(args); hold o.f = v; release; hook C.M(n) => expr; patch C.M => value|nop; unhook C.M|all; hooks.";
 case "release": ovRelease("code"); return "released";
 case "hooks": { const l = HOOKS.list(); return l.length ? l.map((r) => r.label + "  " + r.hits + " hits" + (r.err ? "  ERR " + r.err : "")).join("\n") : "no hooks"; }
 case "unhook": { if (n.all) { HOOKS.off(); return "all hooks removed"; } const t = csTarget(n.target); const r = HOOKS.list().find((x) => x.fn === t.f.m.fn); if (!r) return "not hooked"; HOOKS.off(r); return "unhooked " + t.label; }
@@ -1452,7 +1541,11 @@ case "cmd": { const r = csCommand(n, sc, out); if (top && r !== undefined) out(r
 throw new Error("unsupported statement " + n.k);
 }
 function csRun(src) {
-if (!RT || !RT.ok) return "not connected yet, wait for the green dot";
+if (!RT || !RT.ok) {
+const trimmed = String(src || "").trim();
+if (/^diag\s*\(\s*\)\s*;?$/.test(trimmed)) return CSB.diag();
+return "not connected yet — type diag() for details, or wait for the green dot in the panel header";
+}
 const lines = [], out = (x) => lines.push(x);
 let prog;
 try { prog = new CsParser(src).program(); } catch (e) { return "syntax error, " + (e.message || e); }
@@ -1462,16 +1555,15 @@ catch (e) { out("error" + (st.k === "expr" || st.k === "var" ? "" : " in " + st.
 }
 return lines.join("\n");
 }
-// JavaScript (the old console) is still understood: anything using ss., function, const/let, or starting with //js
 const looksJS = (code) => /(^|\n)\s*\/\/\s*js\b|\bss\.|\bfunction\b|(^|\n)\s*(const|let)\s/.test(code) && !/(^|\n)\s*(hook|patch)\s/.test(code);
 
-// ---------- translator: the same parse tree to frida-il2cpp-bridge JavaScript ----------
+// ---------- Frida translator ----------
 function csToFrida(src) {
 let prog;
 try { prog = new CsParser(src).program(); } catch (e) { return "// syntax error, " + (e.message || e); }
 const classes = new Map(), declared = [new Set()];
 const isDecl = (n) => declared.some((s) => s.has(n));
-const asmOf = (full) => { const l = RT && RT.ok && RT.cls(full); return l ? RT.meta.assemblyOf(l[0]) : (/^UnityEngine/.test(full) ? "UnityEngine.CoreModule" : "Assembly-CSharp"); };
+const asmOf = (full) => { const l = RT && RT.ok && RT.cls(full); return l ? RT.meta.assemblyOf(l[0]) : "Assembly-CSharp"; };
 const clsVar = (full) => { const id = "C_" + full.replace(/[^A-Za-z0-9]/g, "_"); if (!classes.has(id)) classes.set(id, { asm: asmOf(full), full }); return id; };
 const chain = (n) => { if (n.k === "id") return [n.n]; if (n.k === "mem") { const l = chain(n.o); return l ? l.concat(n.n) : null; } return null; };
 const asClass = (n) => { const c = chain(n); if (!c || isDecl(c[0])) return null; for (let i = c.length; i >= 1; i--) { const full = RT && RT.ok ? csClass(c.slice(0, i).join(".")) : (i === c.length ? c.join(".") : null); if (full && i === c.length) return full; } return null; };
@@ -1561,7 +1653,7 @@ return head.concat(["  // classes"], consts, ["", "  // your script"], lines, ["
 }
 
 // ===================================================================================================
-// UI: gold glass panel in its own iframe (so the game never sees your key presses)
+// UI
 // ===================================================================================================
 let D = document;
 const IC = {
@@ -1584,7 +1676,8 @@ map: '<path d="M9 4L3 6v14l6-2 6 2 6-2V4l-6 2z"/><path d="M9 4v14M15 6v14"/>',
 list: '<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/>',
 cube: '<path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/>',
 min: '<path d="M5 12h14"/>',
-dot: '<circle cx="12" cy="12" r="5" fill="currentColor"/>'
+dot: '<circle cx="12" cy="12" r="5" fill="currentColor"/>',
+scan: '<path d="M3 7V5a2 2 0 0 1 2-2h2M21 7V5a2 2 0 0 0-2-2h-2M3 17v2a2 2 0 0 0 2 2h2M21 17v2a2 2 0 0 1-2 2h-2"/><circle cx="12" cy="12" r="3"/>'
 };
 const icon = (n, s) => { const x = D.createElement("span"); x.className = "ic"; s = s || 16; x.innerHTML = '<svg viewBox="0 0 24 24" width="' + s + '" height="' + s + '" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' + (IC[n] || "") + "</svg>"; return x; };
 const el = (tag, props, kids) => { const n = D.createElement(tag); if (props) Object.assign(n, props); (kids || []).forEach((k) => k && n.appendChild(k)); return n; };
@@ -1687,11 +1780,11 @@ if (PANEL) PANEL.style.zoom = S.zoom / 100;
 place();
 };
 
-// ----- header, status, tabs -----
+// ----- header -----
 const statDot = el("div", { className: "d" }), statTxt = el("span", { textContent: "starting..." });
 const stat = el("div", { className: "stat" }, [statDot, statTxt, ibtn("refresh", () => { if (RT && RT.ok) RT.refresh(false); say("refreshing objects"); }, "refresh the object list")]);
 const minBtn = el("button", { className: "hb", title: "minimize" }, [icon("min", 14)]);
-const head = el("div", { className: "h" }, [el("div", { className: "logo" }, [icon("spawn", 18)]), el("div", { className: "ttl1" }, [D.createTextNode("Subway Surfers"), el("span", { className: "pro", textContent: "PRO" }), el("small", { textContent: "mod menu v2" })]), el("div", { className: "sp" }), minBtn]);
+const head = el("div", { className: "h" }, [el("div", { className: "logo" }, [icon("spawn", 18)]), el("div", { className: "ttl1" }, [D.createTextNode("Subway Surfers"), el("span", { className: "pro", textContent: "PRO" }), el("small", { textContent: "mod menu v3" })]), el("div", { className: "sp" }), minBtn]);
 
 // ===== SPAWN =====
 const chunkOut = el("div", { className: "tbl" }), chunkHead = el("div", { className: "note" });
@@ -1759,7 +1852,57 @@ el("div", { className: "btns" }, [btn("Refresh list", pkRender, "", "refresh")])
 const tuneCard = card("Powerup tuning", TUNE.map((t) => el("div", { className: "row" }, [lbl(t.title, t.sub), RR(num(() => S.vals[t.id], (v) => { S.vals[t.id] = v; persist(); }, true), groupSw(t.id))])), "spawn");
 const pageSpawn = el("div", { className: "pg" }, [pickCard, chunkCard, tuneCard]);
 
-// ===== DEVELOPER =====
+// ===== SCAN =====
+function ssScanEl() {
+const wrap = el("div", {});
+wrap.style.cssText = "display:flex;flex-direction:column;gap:6px;font:12px/1.35 " + MONO + ";color:#eee;";
+const row = (...kids) => { const d = el("div"); d.style.cssText = "display:flex;gap:4px;flex-wrap:wrap;align-items:center;"; kids.forEach((k) => d.appendChild(k)); return d; };
+const typeSel = el("select", { className: "sel" });
+["int32", "uint32", "float", "double", "int16", "int8"].forEach((t) => { const o = el("option", { value: t, textContent: t }); typeSel.appendChild(o); });
+typeSel.value = MS.type; typeSel.onchange = () => MS.type = typeSel.value;
+const valIn = el("input", { className: "txt", placeholder: "value", spellcheck: false }); valIn.style.flex = "1";
+const first = btn("First Scan", async () => {
+if (MS.busy) return; MS.busy = true;
+try {
+const v = parseFloat(valIn.value); if (isNaN(v)) throw new Error("enter a number");
+MS.prev = await msFirstScan(MS.type, v, (p) => { status.textContent = "scanning… " + Math.round(p * 100) + "%"; });
+status.textContent = MS.prev.length + " result(s)"; render();
+} catch (e) { status.textContent = "error: " + e.message; }
+finally { MS.busy = false; }
+}, "hot");
+const next = btn("Next Scan", () => {
+if (!MS.prev.length) { status.textContent = "run a First Scan first"; return; }
+const v = parseFloat(valIn.value); if (isNaN(v)) { status.textContent = "enter a number"; return; }
+MS.prev = msNextScan(MS.type, v, MS.prev);
+status.textContent = MS.prev.length + " result(s)"; render();
+});
+const reset = btn("Reset", () => { MS.prev = []; status.textContent = ""; render(); });
+const status = el("div"); status.style.cssText = "color:#9a9;min-height:16px;white-space:pre-wrap;";
+const list = el("div", { className: "tbl" });
+function render() {
+list.innerHTML = "";
+if (!MS.prev.length) { list.appendChild(el("div", { className: "tr" }, [el("div", { className: "nm", textContent: "no results" })])); return; }
+MS.prev.slice(0, 300).forEach((addr) => {
+const v = msRead(addr, MS.type);
+const a = el("div", { className: "nm", textContent: "0x" + addr.toString(16).padStart(8, "0") }); a.style.color = "#aaa";
+const vv = el("div", { className: "nm", textContent = "= " + v }); 
+const inp = el("input", { type: "text", spellcheck: false, placeholder: "new" });
+const setBtn = ibtn("target", () => { msWrite(addr, MS.type, parseFloat(inp.value)); render(); }, "set");
+list.appendChild(el("div", { className: "tr" }, [a, vv, inp, setBtn]));
+});
+if (MS.prev.length > 300) list.appendChild(el("div", { className: "tr" }, [el("div", { className: "nm", textContent: "… " + (MS.prev.length - 300) + " more" })]));
+}
+render();
+wrap.append(row(typeSel, valIn), row(first, next, reset), status, list);
+return wrap;
+}
+const scanCard = card("Raw memory scanner", [
+el("div", { className: "note", textContent: "Searches the wasm heap for an exact value. Type a number, First Scan, change it in-game, Next Scan, then set the survivors. Works even if IL2CPP scanning isn't ready. Reload after edits to commit." }),
+ssScanEl()
+], "scan");
+const pageScan = el("div", { className: "pg hide" }, [scanCard]);
+
+// ===== DEV =====
 const devActiveSel = el("div", { className: "note" });
 const incC = { coins: 1000000, keys: 1000 };
 const devCard = card("Developer settings", [
@@ -1799,7 +1942,6 @@ const r = el("div", { className: "tr" }, [el("div", { className: "nm link", text
 r.firstChild.onclick = () => { ex.cls = i; ex.objs = (RT.objs.get(i) || []).slice(0, 60); ex.obj = null; ex.stack = []; exRender(); };
 exList.appendChild(r);
 });
-// objects by their Unity name (characters, prefab instances, scene objects)
 if (q.length >= 3) {
 const hits = objectNames().filter((h) => h.name.toLowerCase().indexOf(q) >= 0).slice(0, 60);
 if (hits.length) exList.appendChild(el("div", { className: "tr" }, [el("div", { className: "ttl" }, [D.createTextNode("Objects named like \"" + q + "\"")])]));
@@ -1816,7 +1958,6 @@ const out = el("div", { className: "nm", textContent: "tap get", style: "text-al
 const row = el("div", { className: "tr" }, [el("div", { className: "nm", textContent: m.name.replace("get_", ""), title: m.owner + "." + m.name }), el("div", { className: "ty", textContent: m.ret.replace("System.", "") }), out, ibtn("play", () => { try { const r = RT.call(m, a, []); out.textContent = RT.fmtRet(m, r); if (m.ret !== "System.Void" && /^0x/.test(out.textContent)) { out.className = "nm link"; out.onclick = () => exOpen(parseInt(out.textContent, 16) >>> 0, true); } } catch (e) { out.textContent = "err: " + (e.message || e); } }, "read")]);
 return row;
 }
-// text box -> argument, by the parameter's real type (strings, vectors, enums by name, 64-bit)
 function parseArg(p, text) {
 text = text.trim();
 if (p.type === "System.Boolean") return text === "true" || text === "1";
@@ -1876,19 +2017,22 @@ ins.fields.forEach((f) => {
 if (f.isConst || (f.isStatic && !RT.L.statics)) return;
 const key = f.owner + "." + f.name + (f.isStatic ? "#s" : "");
 if (seen.has(key)) return; seen.add(key);
-const editable = ["float", "double", "int", "uint", "short", "ushort", "byte", "sbyte", "bool", "long", "ulong", "char"].indexOf(f.kind) >= 0;
+const editable = ["float", "double", "int", "uint", "short", "ushort", "byte", "sbyte", "bool", "long", "ulong", "char"].indexOf(f.kind) >= 0 || VEC_SIZES[f.tn];
 const isRef = ["object", "array", "generic", "T", "ptr"].indexOf(f.kind) >= 0;
 const nm = el("div", { className: "nm", textContent: (f.isStatic ? "static " : "") + f.name, title: f.owner + "." + f.name });
 const ty = el("div", { className: "ty", textContent: f.tn, title: f.tn });
 let val;
 if (editable) {
-val = el("input", { type: "text", spellcheck: false, value: f.enumTi >= 0 ? String(RT.read(a, f)) : RT.show(a, f) });
+const init = VEC_SIZES[f.tn] ? (csFieldVal(a, f) || []).join(",") : (f.enumTi >= 0 ? String(RT.read(a, f)) : RT.show(a, f));
+val = el("input", { type: "text", spellcheck: false, value: init });
 val.title = f.enumTi >= 0 ? RT.show(a, f) : "";
 val.onchange = () => {
 try {
 let v = val.value.trim();
-if (f.kind === "bool") v = v === "true" || v === "1"; else { v = Number(v); if (!isFinite(v)) { val.value = RT.show(a, f); return; } }
-RT.write(a, f, v); if (ex.locks.has(key)) ex.locks.get(key).v = v;
+if (VEC_SIZES[f.tn]) { v = v.replace(/[()\[\]]/g, "").split(",").map(Number); if (v.some((x) => !isFinite(x))) { val.value = init; return; } }
+else if (f.kind === "bool") v = v === "true" || v === "1";
+else { v = Number(v); if (!isFinite(v)) { val.value = RT.show(a, f); return; } }
+csSetField(a, f, v); if (ex.locks.has(key)) ex.locks.get(key).v = v;
 say(f.name + " = " + v);
 } catch (e) { say("write failed: " + e.message); }
 };
@@ -1911,7 +2055,6 @@ if (others.length) { exFields.appendChild(el("div", { className: "tr" }, [el("di
 }
 exSearch.addEventListener("input", () => { clearTimeout(exSearch.__t); exSearch.__t = setTimeout(exClasses, 200); });
 
-// classes: every type in the game (also the ones with no live object), and a read-only C# view of any of them
 const srcState = { ti: null };
 const clsSearch = el("input", { type: "text", className: "txt", placeholder: "search any class, enum or namespace...", spellcheck: false });
 const clsList = el("div", { className: "tbl" });
@@ -1951,7 +2094,7 @@ const pageEx = el("div", { className: "pg hide" }, [subBar, exObjCard, exInspCar
 function setSub(v) { ex.view = v; const o = v === "objects"; exObjCard.style.display = o ? "" : "none"; exInspCard.style.display = o ? "" : "none"; exClsCard.style.display = o ? "none" : ""; exSrcCard.style.display = o ? "none" : ""; Array.from(subBar.children).forEach((b) => b.classList.toggle("on", b.__v === v)); if (!o) clsRender(); }
 [["objects", "Objects", "list"], ["classes", "Classes", "cube"]].forEach(([v, t, ic]) => { const b = btn(t, () => setSub(v), "", ic); b.__v = v; subBar.appendChild(b); });
 
-// ===== CONSOLE: C# style invoker/patcher (JavaScript with ss.* still works) =====
+// ===== CONSOLE =====
 const conIn = el("textarea", { className: "txt", spellcheck: false, placeholder: "// C# on the live game\nvar jake = find(\"Jake\");\nif (jake != null) {\n  var t = jake.transform;\n  t.localScale = new Vector3(2f, 2f, 2f);\n}" });
 const conOut = el("pre", { className: "out", textContent: "(output)" }), macroBox = el("div", { className: "btns" });
 const macroName = el("input", { type: "text", className: "txt", placeholder: "name for a custom button..." });
@@ -1971,7 +2114,11 @@ newString: (s) => RT.newString(s),
 hook: HOOKS, cs: (src) => csRun(src), frida: (src) => csToFrida(src), wallet: (k, n) => walletAdd(k, n), names: () => objectNames(true), source: (ti) => RT.classSource(ti), inRun: () => inRun(),
 rescan: () => RT.refresh(true), u32: (a) => RT.M.HEAPU32[a >>> 2], f32: (a) => RT.M.HEAPF32[a >>> 2],
 setU32: (a, v) => { RT.M.HEAPU32[a >>> 2] = v >>> 0; }, setF32: (a, v) => { RT.M.HEAPF32[a >>> 2] = v; },
-Module: () => getModule(), say
+Module: () => getModule(), say,
+scanFirst: (v, t) => msScanSync(t || "int32", +v),
+scanNext: (v, addrs, t) => msNextScan(t || "int32", +v, addrs || MS.prev),
+scanWrite: (addr, v, t) => { msWrite(addr >>> 0, t || "int32", +v); return "ok"; },
+diag: () => CSB.diag()
 };
 window.ss = api;
 const runJS = (code) => { try { return (0, eval)("(function(ss){ return (" + code + "\n)})")(api); } catch (e1) { return (0, eval)("(function(ss){" + code + "\n})")(api); } };
@@ -1996,7 +2143,7 @@ persist();
 }
 const pageCon = el("div", { className: "pg hide" }, [
 card("Custom code", [conIn, el("div", { className: "btns" }, [btn("Run", () => { try { const v = runCode(conIn.value); conOut.textContent = v === undefined ? "ok" : (typeof v === "object" ? JSON.stringify(v, null, 1) : String(v)); } catch (e) { conOut.textContent = "error: " + (e.message || e); } }, "hot", "play"), btn("Clear", () => { conIn.value = ""; conOut.textContent = "(output)"; }, "", "trash")]), el("div", { className: "btns" }, [btn("To Frida JS", () => { conOut.textContent = looksJS(conIn.value) ? "// this is already JavaScript" : csToFrida(conIn.value); }, "", "console"), btn("Copy output", () => copyText(conOut.textContent), "", "copy")]), conOut,
-el("div", { className: "note", textContent: "Real C# subset on the live game: var x = find(\"Jake\"); x.transform.localScale = new Vector3(2,2,2); if / for / foreach; Class.Method(args); hold, hook, patch, hooks. find(\"Name\") searches classes, then GameObject names. To Frida JS turns your code into frida-il2cpp-bridge JavaScript. Type help. JavaScript with ss.* still works too." })], "console"),
+el("div", { className: "note", textContent: "C# subset on the live game. Try: diag(); player(); objects(\"jake\"); classes(\"player\"); find(\"Jake\"); if (find(\"Jake\") != null) find(\"Jake\").transform.localScale = new Vector3(2,2,2); scanFirst(1234); scanNext(1234, prev); scanWrite(addr, 999); Type help. JavaScript with ss.* still works too." })], "console"),
 card("My buttons", [macroName, el("div", { className: "btns" }, [btn("Save code as button", () => { const n = macroName.value.trim(); if (!n || !conIn.value.trim()) { say("give it a name and some code"); return; } S.macros.push({ name: n, code: conIn.value }); persist(); drawMacros(); macroName.value = ""; }, "", "plus")]), macroBox, el("div", { className: "note", textContent: "Right-click or long-press a custom button to delete it." })], "console")
 ]);
 
@@ -2020,23 +2167,23 @@ card("Appearance", [
 R_(lbl("Panel opacity"), slid(40, 100, () => S.ui, (v) => { S.ui = v; applyLook(); persist(); }, "%")),
 R_(lbl("Text size"), slid(70, 150, () => S.zoom, (v) => { S.zoom = v; applyLook(); persist(); }, "%")),
 R_(lbl("Toasts"), sw(() => S.toasts, (v) => { S.toasts = v; persist(); })),
-R_(lbl("Reset panel size"), btn("Reset", () => { S.w = 390; S.h = 600; S.zoom = 100; applyLook(); persist(); })),
-el("div", { className: "note", textContent: "Drag the header to move the panel and the gold corner to resize it. Press H in the game to hide or show it." })
+R_(lbl("Reset panel size & position"), btn("Reset", () => { S.w = 390; S.h = 600; S.zoom = 100; S.x = 12; S.y = 12; applyLook(); persist(); })),
+el("div", { className: "note", textContent: "Drag the header to move the panel and the gold corner to resize it. Press H in the game to hide or show it. If the panel ever disappears, tap the SS button in the bottom-left of the page." })
 ], "prefs"),
 card("Log", [logOut, el("div", { className: "btns" }, [btn("Copy log", () => copyText(LOG.join("\n")), "", "copy")])], "list")
 ]);
 
-const TABS = [["Spawn", "spawn", pageSpawn], ["Dev", "dev", pageDev], ["Explore", "explorer", pageEx], ["Code", "console", pageCon], ["Save", "save", pageSave], ["Prefs", "prefs", pagePrefs]];
+const TABS = [["Spawn", "spawn", pageSpawn], ["Scan", "scan", pageScan], ["Dev", "dev", pageDev], ["Explore", "explorer", pageEx], ["Code", "console", pageCon], ["Save", "save", pageSave], ["Prefs", "prefs", pagePrefs]];
 const pill = el("div", { className: "pill" }); pill.style.width = "calc((100% - 6px) / " + TABS.length + ")";
 const tabEls = TABS.map(([name, ic], i) => { const t = el("div", { className: "tab" }, [icon(ic, 16), D.createTextNode(name)]); t.onclick = () => setTab(i); return t; });
 const setTab = (i) => {
 S.tab = i; persist();
-uiOpen.explorer = i === 2; uiOpen.spawn = i === 0;
+uiOpen.explorer = i === 3; uiOpen.spawn = i === 0; uiOpen.scan = i === 1;
 pill.style.transform = "translateX(" + (i * 100) + "%)";
 tabEls.forEach((t, j) => t.classList.toggle("on", j === i));
 TABS.forEach(([, , p], j) => p.classList.toggle("hide", j !== i));
 if (i === 0) { chunkRender(); pkRender(); }
-if (i === 2) { exClasses(); exRender(); if (ex.view === "classes") clsRender(); }
+if (i === 3) { exClasses(); exRender(); if (ex.view === "classes") clsRender(); }
 };
 BODY = el("div", { className: "b" }, TABS.map((t) => t[2]));
 const rs = el("div", { className: "rs", title: "drag to resize" });
@@ -2044,7 +2191,7 @@ PANEL = el("div", { className: "p" }, [head, stat, el("div", { className: "tabs"
 doc.body.appendChild(PANEL);
 bodyEls = { statDot, statTxt, stat, saveInfo, logOut, devActiveSel };
 
-// ----- toasts live in the main page (the iframe is too small to show them) -----
+// ----- toasts -----
 const tbox = document.createElement("div");
 tbox.style.cssText = "position:fixed;left:50%;top:14px;transform:translateX(-50%);display:flex;flex-direction:column;gap:6px;align-items:center;pointer-events:none;z-index:2147483647";
 document.body.appendChild(tbox);
@@ -2061,7 +2208,25 @@ setTimeout(() => { n.style.opacity = 0; setTimeout(() => n.remove(), 350); }, 24
 while (tbox.children.length > 3) tbox.firstChild.remove();
 };
 
-// ----- drag, resize, minimize (screen coordinates, so the moving iframe cannot disturb itself) -----
+// ----- main-page fallback launcher (for when the iframe is off-screen or blocked) -----
+const launcher = document.createElement("div");
+launcher.id = "ssmod-launcher";
+launcher.textContent = "SS";
+launcher.style.cssText = "position:fixed;left:10px;bottom:10px;width:44px;height:44px;border-radius:50%;background:linear-gradient(135deg,#ffd60a,#ff9f0a);color:#1a1304;display:flex;align-items:center;justify-content:center;font:800 14px system-ui,sans-serif;cursor:pointer;z-index:2147483647;box-shadow:0 2px 10px rgba(0,0,0,.5);user-select:none;";
+launcher.onclick = () => {
+if (!FR) return;
+const hidden = FR.style.display === "none";
+if (hidden) { FR.style.display = ""; if (S.min) { S.min = false; place(); } }
+else FR.style.display = "none";
+};
+document.body.appendChild(launcher);
+addEventListener("resize", () => {
+S.x = Math.max(-S.w + 80, Math.min(innerWidth - 80, S.x));
+S.y = Math.max(0, Math.min(innerHeight - 60, S.y));
+place();
+});
+
+// ----- drag, resize, minimize -----
 const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
 let drag = null;
 head.addEventListener("pointerdown", (e) => { if (e.target.closest && e.target.closest(".hb")) return; drag = { sx: e.screenX, sy: e.screenY, x: S.x, y: S.y }; head.setPointerCapture(e.pointerId); head.style.cursor = "grabbing"; });
@@ -2074,14 +2239,14 @@ rs.addEventListener("pointerdown", (e) => { e.preventDefault(); rsd = { sx: e.sc
 rs.addEventListener("pointermove", (e) => { if (!rsd) return; S.w = clamp(Math.round(rsd.w + e.screenX - rsd.sx), 300, 1000); S.h = clamp(Math.round(rsd.h + e.screenY - rsd.sy), 240, 1400); place(); });
 const rsEnd = () => { if (rsd) persist(); rsd = null; };
 rs.addEventListener("pointerup", rsEnd); rs.addEventListener("pointercancel", rsEnd);
-rs.addEventListener("dblclick", () => { S.w = 390; S.h = 600; place(); persist(); });
+rs.addEventListener("dblclick", () => { S.w = 390; S.h = 600; S.x = 12; S.y = 12; place(); persist(); });
 addEventListener("keydown", (e) => {
 const t = e.target;
 if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
 if ((e.key === "h" || e.key === "H") && !e.ctrlKey && !e.metaKey && !e.altKey) FR.style.display = FR.style.display === "none" ? "" : "none";
 });
 
-// ----- periodic refresh of the panel -----
+// ----- periodic refresh -----
 setInterval(() => {
 if (S.min) return;
 swDraws.forEach((f) => { try { f(); } catch (e) {} });
@@ -2095,21 +2260,22 @@ if (OV.size) text += "  \u2022  " + OV.size + " held";
 if (HK.size) text += "  \u2022  " + HK.size + " hooked";
 stat.className = "stat " + state; statTxt.textContent = text;
 saveInfo.textContent = "engine save sync: " + SAVE.engine + "\nbackup files: " + SAVE.files + (SAVE.lastBackup ? "  (last " + new Date(SAVE.lastBackup).toLocaleTimeString() + ")" : "") + "\nrestored this session: " + SAVE.restored + (SAVE.err ? "\nnote: " + SAVE.err : "");
-if (S.tab === 5) logOut.textContent = LOG.slice(-60).join("\n");
-if (S.tab === 1 && RT && RT.ok) {
+if (S.tab === 6) logOut.textContent = LOG.slice(-60).join("\n");
+if (S.tab === 2 && RT && RT.ok) {
 const f = RT.liveAll(DEVC)[0];
 devActiveSel.textContent = f ? "DebugSettings found (" + hex(f) + ")" : "DebugSettings does not exist yet, the game only creates it on demand. Switch a setting on twice to try creating it.";
 }
-if (S.tab === 2) exRows.forEach(([inp, f, a]) => { if (D.activeElement === inp) return; try { const s = f.enumTi >= 0 ? String(RT.read(a, f)) : RT.show(a, f); if (inp.value !== s) inp.value = s; } catch (e) {} });
+if (S.tab === 3) exRows.forEach(([inp, f, a]) => { if (D.activeElement === inp) return; try { const s = VEC_SIZES[f.tn] ? (csFieldVal(a, f) || []).join(",") : (f.enumTi >= 0 ? String(RT.read(a, f)) : RT.show(a, f)); if (inp.value !== s) inp.value = s; } catch (e) {} });
 }, 600);
 setInterval(() => { ex.locks.forEach((L) => { try { RT.write(L.a, L.f, L.v); } catch (e) {} }); }, 100);
 
 applyLook(); drawMacros(); setSub("objects");
 setTab(S.tab >= 0 && S.tab < TABS.length ? S.tab : 0);
-dlog("Subway Surfers mod v2 ready");
+dlog("Subway Surfers mod v3 ready");
 }
 
 if (document.body) buildUI(); else addEventListener("DOMContentLoaded", buildUI);
 window.__ssRT = () => RT;
-dlog("Subway Surfers mod v2 loaded, save fix active, connecting when the game starts");
+dlog("Subway Surfers mod v3 loaded, save fix active, connecting when the game starts");
+
 })();
