@@ -2278,4 +2278,203 @@ if (document.body) buildUI(); else addEventListener("DOMContentLoaded", buildUI)
 window.__ssRT = () => RT;
 dlog("Subway Surfers mod v3 loaded, save fix active, connecting when the game starts");
 
+/* ============================================================================
+   LIVE GUI EDITOR PATCH
+   ============================================================================ */
+(function ssGuiEditor() {
+  if (window.__ssGuiEditor) return;
+  window.__ssGuiEditor = true;
+
+  const UI_TEXT = "UnityEngine.UI.Text";
+  const UI_IMAGE = "UnityEngine.UI.Image";
+
+  // State
+  const gui = { list: [], selected: null, magicWand: false };
+
+  function getGUIName(obj) {
+    try {
+      const go = RT.invoke(RT.findMethod(RT.rw(obj), "get_gameObject", 0), obj, []);
+      if (!go) return "Unknown UI";
+      const name = RT.invoke(RT.findMethod(RT.rw(go), "get_name", 0), go, []);
+      return RT.readStr(name) || "UI Element";
+    } catch (e) { return "UI Element"; }
+  }
+
+  function getText(obj) {
+    try {
+      const m = RT.findMethod(RT.rw(obj), "get_text", 0);
+      if (!m) return "";
+      const s = RT.invokeF(m, obj, []);
+      return typeof s === "string" ? s : "";
+    } catch (e) { return ""; }
+  }
+
+  function setText(obj, val) {
+    try {
+      const m = RT.findMethod(RT.rw(obj), "set_text", 1);
+      if (m) RT.invoke(m, obj, [val]);
+    } catch (e) { say("Failed to set text: " + e.message); }
+  }
+
+  function getColor(obj) {
+    try {
+      const m = RT.findMethod(RT.rw(obj), "get_color", 0);
+      if (!m) return [1,1,1,1];
+      const c = RT.invoke(m, obj, []);
+      return Array.isArray(c) ? c : [1,1,1,1];
+    } catch (e) { return [1,1,1,1]; }
+  }
+
+  function setColor(obj, colorArray) {
+    try {
+      const m = RT.findMethod(RT.rw(obj), "set_color", 1);
+      if (m) RT.invoke(m, obj, [colorArray]);
+    } catch (e) { say("Failed to set color: " + e.message); }
+  }
+
+  function buildUI() {
+    // We create a new page for the GUI Editor
+    const pageGUI = document.createElement("div");
+    pageGUI.className = "pg hide";
+    pageGUI.id = "ss-gui-editor-page";
+
+    // Left: The List
+    const listDiv = document.createElement("div");
+    listDiv.className = "tbl";
+    listDiv.style.height = "300px";
+
+    // Right: The Editor
+    const editorDiv = document.createElement("div");
+    editorDiv.style.display = "none";
+    editorDiv.style.flexDirection = "column";
+    editorDiv.style.gap = "10px";
+
+    // Preview Canvas
+    const previewBox = document.createElement("div");
+    previewBox.style.cssText = "background:#111;border:1px solid #333;border-radius:8px;padding:10px;min-height:80px;display:flex;align-items:center;justify-content:center;overflow:hidden;";
+    const previewText = document.createElement("span");
+    previewText.style.cssText = "font-family:sans-serif;font-size:24px;font-weight:bold;";
+    previewBox.appendChild(previewText);
+
+    // Controls
+    const textInput = document.createElement("input");
+    textInput.className = "txt";
+    textInput.placeholder = "Change Text...";
+    textInput.oninput = () => {
+      if (!gui.selected) return;
+      setText(gui.selected, textInput.value);
+      previewText.textContent = textInput.value;
+    };
+
+    const colorInput = document.createElement("input");
+    colorInput.type = "color";
+    colorInput.style.cssText = "width:100%;height:30px;border:none;background:none;cursor:pointer;";
+    colorInput.oninput = () => {
+      if (!gui.selected) return;
+      const hex = colorInput.value;
+      const r = parseInt(hex.slice(1,3),16)/255;
+      const g = parseInt(hex.slice(3,5),16)/255;
+      const b = parseInt(hex.slice(5,7),16)/255;
+      setColor(gui.selected, [r,g,b,1]);
+      previewText.style.color = hex;
+    };
+
+    // Keyboard Shortcuts
+    document.addEventListener("keydown", (e) => {
+      if (e.ctrlKey && e.key === "c" && gui.selected) {
+        const txt = textInput.value || getText(gui.selected);
+        navigator.clipboard.writeText(txt);
+        say("Copied text to clipboard");
+      }
+    });
+
+    editorDiv.append(previewBox, textInput, colorInput);
+
+    // Assemble Page
+    const scanBtn = document.createElement("button");
+    scanBtn.className = "btn hot";
+    scanBtn.textContent = "Scan Game UI";
+    scanBtn.onclick = () => {
+      if (!RT || !RT.ok) { say("Wait for game connection"); return; }
+      gui.list = [];
+      const texts = RT.findAll(UI_TEXT);
+      const images = RT.findAll(UI_IMAGE);
+      
+      texts.forEach(t => gui.list.push({ obj: t, type: "Text", name: getGUIName(t) }));
+      images.forEach(i => gui.list.push({ obj: i, type: "Image", name: getGUIName(i) }));
+      
+      renderList();
+      say(`Found ${gui.list.length} UI elements`);
+    };
+
+    function renderList() {
+      listDiv.innerHTML = "";
+      gui.list.forEach(item => {
+        const row = document.createElement("div");
+        row.className = "tr";
+        row.style.cursor = "pointer";
+        row.innerHTML = `<div class="nm">${item.name}</div><div class="ty">${item.type}</div>`;
+        row.onclick = () => {
+          gui.selected = item.obj;
+          editorDiv.style.display = "flex";
+          
+          if (item.type === "Text") {
+            const t = getText(item.obj);
+            textInput.value = t;
+            previewText.textContent = t;
+            const c = getColor(item.obj);
+            const hex = "#" + [c[0],c[1],c[2]].map(x => Math.round(x*255).toString(16).padStart(2,'0')).join("");
+            colorInput.value = hex;
+            previewText.style.color = hex;
+          } else {
+            textInput.value = "[Image Component]";
+            textInput.disabled = true;
+            previewText.textContent = "";
+            previewBox.style.background = "#333";
+          }
+        };
+        listDiv.appendChild(row);
+      });
+    }
+
+    pageGUI.append(
+      card("Live GUI Scanner", [scanBtn, listDiv], "console"),
+      card("GUI Editor", [editorDiv], "prefs")
+    );
+
+    // Inject the tab into the main UI
+    // We wait for the main UI to build before injecting
+    setTimeout(() => {
+      const tabsContainer = document.querySelector(".tabs");
+      if (!tabsContainer) return;
+      
+      const newTab = document.createElement("div");
+      newTab.className = "tab";
+      newTab.innerHTML = `<span class="ic"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg></span>GUI`;
+      newTab.onclick = () => {
+        // Deselect other tabs
+        document.querySelectorAll(".tab").forEach(t => t.classList.remove("on"));
+        document.querySelectorAll(".pg").forEach(p => p.classList.add("hide"));
+        // Select ours
+        newTab.classList.add("on");
+        pageGUI.classList.remove("hide");
+        // Move pill
+        const pill = document.querySelector(".pill");
+        if (pill) pill.style.transform = `translateX(500%)`; // Rough calc for 6th tab
+      };
+
+      tabsContainer.appendChild(newTab);
+      document.querySelector(".b").appendChild(pageGUI);
+    }, 2000); // Wait 2s for main UI to mount
+  }
+
+  // Wait for RT and UI to be ready
+  const waitForGame = setInterval(() => {
+    if (RT && RT.ok && document.querySelector(".tabs")) {
+      clearInterval(waitForGame);
+      buildUI();
+    }
+  }, 1000);
+
+})();
 })();
