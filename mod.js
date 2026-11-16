@@ -777,8 +777,10 @@ return hit;
 const C_CONT = "SYBO.Subway.Routes.WeightRandomizedPrefabContainter`2";
 const C_RANDOM = "SYBO.Common.Utilities.SyboRandom";
 function entryName(e, nm) {
-let name = nm ? (RT.readStr(RT.read(e, nm)) || "") : "";
-if (!name) { for (const n of ["_prefab", "Prefab", "prefab"]) { const f = RT.fieldOf(e, n); if (f) { const pn = unityName(RT.read(e, f)); if (pn) { name = pn; break; } } } }
+let name = "";
+for (const f of nm ? [nm] : []) { try { const s = RT.readStr(RT.read(e, f)); if (s) { name = s; break; } } catch (x) {} }
+if (!name) for (const n of ["_name", "<Name>k__BackingField", "Name", "<name>k__BackingField"]) { const f = RT.fieldOf(e, n); if (!f) continue; try { const s = RT.readStr(RT.read(e, f)); if (s) { name = s; break; } } catch (x) {} }
+if (!name) for (const n of ["_prefab", "Prefab", "prefab", "<Prefab>k__BackingField"]) { const f = RT.fieldOf(e, n); if (f) { try { const pn = unityName(RT.read(e, f)); if (pn) { name = pn; break; } } catch (x) {} } }
 return name || "?";
 }
 function chunkContainers() {
@@ -789,7 +791,7 @@ for (const c of RT.findAll(C_CONT)) {
 try {
 const lf = RT.fieldOf(c, "_weightedPrefabs"); if (!lf) continue;
 const list = RT.read(c, lf); if (!list) continue;
-const nf = RT.fieldOf(c, "<Name>k__BackingField");
+const nf = RT.fieldOf(c, "<Name>k__BackingField") || RT.fieldOf(c, "_name") || RT.fieldOf(c, "Name");
 const name = nf ? RT.readStr(RT.read(c, nf)) : null;
 const entries = RT.listItems(list).filter((e) => RT.inHeap(e)).map((e) => { const wf = RT.fieldOf(e, "Weight"), nm = RT.fieldOf(e, "_name"); return { addr: e, wf, name: entryName(e, nm) }; }).filter((e) => e.wf);
 entries.forEach((e) => seen.add(e.addr));
@@ -896,20 +898,26 @@ defGroup("dev_active", () => { const out = []; liveDev({ f: "_active", fn: (o, f
 const INV = "Data.Save.InventorySave";
 function walletAdd(kind, n) {
 if (!RT || !RT.ok) throw new Error("not connected yet");
-const inv = RT.singleton(INV);
-if (!inv) throw new Error("save data not loaded, open main menu");
-const info = RT.inspect(inv);
-if (!info) throw new Error("inventory object is not live");
 const want = kind === "coins" ? "coin" : "key";
-const intish = (f) => ["int", "uint", "long", "ulong"].indexOf(f.kind) >= 0 && !f.isConst && !f.isStatic;
-let field = null;
-for (const f of info.fields) { if (intish(f) && new RegExp(want, "i").test(f.name)) { field = f; if (/_total|_coins?|_keys?/i.test(f.name)) break; } }
-if (!field) for (const f of info.fields) { if (intish(f)) { field = f; break; } }
-if (!field) throw new Error("no int field on InventorySave (" + kind + "); fields: " + info.fields.map((f) => f.name + ":" + f.kind).join(", "));
-let before = RT.read(inv, field);
+const re = new RegExp(want, "i");
+const intish = (f) => ["int", "uint", "long", "ulong", "short", "ushort", "byte"].indexOf(f.kind) >= 0;
+const inv = RT.singleton(INV);
+const found = [];
+const rdV = (obj, f) => { try { const v = RT.read(obj, f); return v === undefined ? null : (f.kind === "long" || f.kind === "ulong" ? Number(v) : f.kind === "int" || f.kind === "short" || f.kind === "sbyte" ? v | 0 : v); } catch (e) { return null; } };
+if (inv) { try { const info = RT.inspect(inv); if (info) for (const f of info.fields) { if (f.isConst) continue; found.push({ f, obj: inv, tag: "inst", v: intish(f) ? rdV(inv, f) : null }); } } catch (e) {} }
+const k = RT.klassByName ? RT.klassByName(INV) : 0;
+if (k) for (const f of RT.klassFields(k)) { if (f.isConst || !intish(f)) continue; found.push({ f, obj: 0, tag: "static", v: rdV(0, f) }); }
+const dump = () => dlog("wallet debug [" + INV + "] singleton=" + (inv ? "0x" + inv.toString(16) : "MISSING") + "\n" + (found.length ? found.map((x) => x.tag + " " + x.f.name + ":" + x.f.kind + (x.f.isStatic ? " (static)" : "") + (x.v !== null ? " = " + x.v : "")).join("\n") : "(no readable fields — instance not found or metadata not ready)"));
+const score = (x) => (/_total/i.test(x.f.name) ? 4 : 0) + (/^_?(coins|keys)$/i.test(x.f.name) ? 2 : 0) + (x.tag === "inst" ? 1 : 0) + (x.f.kind === "int" || x.f.kind === "uint" ? 1 : 0);
+const hits = found.filter((x) => intish(x.f) && re.test(x.f.name)).sort((a, b) => score(b) - score(a));
+if (!inv) { dump(); throw new Error("InventorySave singleton missing — open the main menu first. Field dump logged (copy it with the Log tab)"); }
+if (!hits.length) { dump(); throw new Error("no integer field containing \"" + want + "\" was found on InventorySave (" + found.length + " fields). The exact field names and types are in the log (Log tab) — paste them to the fix list"); }
+const pick = hits[0], field = pick.f, obj = pick.obj;
+let before = RT.read(obj, field);
 if (field.kind === "long" || field.kind === "ulong") before = Number(before); else before = before | 0;
 const next = Math.max(0, Math.min(2000000000, before + Math.round(n)));
-RT.write(inv, field, next);
+RT.write(obj, field, next);
+dlog("wallet[" + want + "] " + field.name + " (" + field.kind + ", " + pick.tag + ") " + before + " -> " + next);
 return before + " -> " + next + "  [" + field.name + "]";
 }
 
@@ -934,7 +942,7 @@ function releaseAll() { try { GROUPS.forEach((g) => { g.on = false; }); ovReleas
 addEventListener("error", (ev) => { const msg = String(ev && ev.message || ""); if (/abort\(/.test(msg) && (OV.size || HK.size)) { releaseAll(); dlog("game aborted, released writes"); } });
 
 // ---------- boot ----------
-let uiOpen = { explorer: false, spawn: false, scan: false };
+let uiOpen = { explorer: false, spawn: false, scan: false, gui: false };
 async function bootTick() {
 const M = getModule();
 if (!M || !M.HEAPU8 || !M.asm) { if (!RT) return; return; }
@@ -942,7 +950,7 @@ if (!RT) RT = makeRT(M, dlog);
 if (!RT.connected) { await RT.connect(); return; }
 const active = GROUPS.size && Array.from(GROUPS.values()).some((g) => g.on) || OV.size > 0;
 const age = Date.now() - RT.lastScan;
-const need = !RT.ok || age > (active || uiOpen.explorer || uiOpen.spawn || uiOpen.scan ? 4000 : 15000);
+const need = !RT.ok || age > (active || uiOpen.explorer || uiOpen.spawn || uiOpen.scan || uiOpen.gui ? 4000 : 15000);
 if (need) await RT.refresh(false);
 }
 setInterval(() => { bootTick().catch((e) => dlog("boot: " + e)); }, 1000);
@@ -1905,7 +1913,7 @@ call: (a, n, ...args) => { const m = RT.findMethod(RT.rw(a), n, args.length); if
 callStatic: (cls, n, ...args) => RT.staticCall(cls, n, args),
 runtimeInvoke: (mi, obj, ...args) => RT.runtimeInvoke(mi, obj, args),
 newString: (s) => RT.newString(s),
-hook: HOOKS, cs: (src) => csRun(src), frida: (src) => csToFrida(src), wallet: (k, n) => walletAdd(k, n), grant: (k) => grantPowerup(k), names: () => objectNames(true), source: (ti) => RT.classSource(ti), inRun: () => inRun(),
+hook: HOOKS, cs: (src) => csRun(src), frida: (src) => csToFrida(src), wallet: (k, n) => walletAdd(k, n), grant: (k) => grantPowerup(k), gui: () => scanGUI(), names: () => objectNames(true), source: (ti) => RT.classSource(ti), inRun: () => inRun(),
 rescan: () => RT.refresh(true), u32: (a) => RT.M.HEAPU32[a >>> 2], f32: (a) => RT.M.HEAPF32[a >>> 2],
 setU32: (a, v) => { RT.M.HEAPU32[a >>> 2] = v >>> 0; }, setF32: (a, v) => { RT.M.HEAPF32[a >>> 2] = v; },
 Module: () => getModule(), say,
@@ -1953,6 +1961,168 @@ btn("Wipe", function () { if (performance.now() - wipeArmed > 3000) { wipeArmed 
 saveTa], "save")
 ]);
 
+// ===== GUI editor =====
+const GUI_RE = /(UnityEngine\.UI|UnityEngine\.Canvas)|\b(Text|Image|RawImage|UILabel|UIButton|UISprite|UIPanel|UIWidget|Canvas|Button|Toggle|Slider|InputField)$/;
+const guiState = { list: [], sel: null, busy: false, q: "", done: 0, hits: 0 };
+const guiEd = { text: "", r: 1, g: 1, b: 1, a: 1, x: 0, y: 0, z: 0, sx: 1, sy: 1, sz: 1 };
+const guiCam = { x: 0, y: 0, z: 0, zoom: 1 };
+function guiGet(o, name, argc) { const m = RT.findMethod(RT.rw(o), name, argc || 0); if (!m) return null; try { return RT.invokeF(m, o, []); } catch (e) { return null; } }
+function guiGoOf(o) { try { const go = guiGet(o, "get_gameObject", 0) >>> 0; if (go) return go; } catch (e) {} return /GameObject$/.test(RT.klassName(RT.rw(o)) || "") ? o : 0; }
+function guiActive(go) { try { return !!guiGet(go, "get_activeInHierarchy", 0); } catch (e) { return false; } }
+async function scanGUI() {
+if (!RT || !RT.ok) { say("not connected yet"); return; }
+if (guiState.busy) return;
+guiState.busy = true; guiState.list = []; guiState.sel = null; guiState.done = 0; guiState.hits = 0; guiRender(); guiRenderEd();
+try {
+for (const [ti, objs] of (RT.objs || [])) {
+let kn = ""; try { kn = RT.meta.name(ti) || ""; } catch (e) {}
+if (!kn || !GUI_RE.test(kn)) continue;
+for (const o of objs) {
+guiState.done++;
+if (guiState.done % 50 === 0) { guiRender(); await new Promise(r => setTimeout(r, 0)); }
+try {
+if (!RT.inHeap(o) || !RT.isLive(o)) continue;
+const go = guiGoOf(o); if (!go || !RT.isLive(go) || !guiActive(go)) continue;
+const name = unityName(go) || RT.klassName(RT.rw(o)) || "?";
+let pos = [0, 0, 0], scl = [1, 1, 1];
+const tr = guiGet(o, "get_transform") >>> 0;
+if (tr) { const p = guiGet(tr, "get_position"); if (Array.isArray(p) && p.length >= 3) pos = p; const s = guiGet(tr, "get_localScale"); if (Array.isArray(s) && s.length >= 3) scl = s; }
+guiState.list.push({ addr: o, go, tr, name, cls: kn, pos, scl });
+guiState.hits++;
+if (guiState.list.length >= 3000) break;
+} catch (e) {}
+}
+if (guiState.list.length >= 3000) break;
+}
+} catch (e) {}
+guiState.busy = false; guiRender();
+say("GUI scan: " + guiState.hits + " live UI objects");
+}
+function guiVec3Set(o, setter, x, y, z) {
+const m = RT.findMethod(RT.rw(o), setter, 3); if (!m) throw new Error("no " + setter);
+const f = RT.M["dynCall_vifffi"]; if (!f) throw new Error("dynCall_vifffi missing in this build");
+f(m.fn, o, +x, +y, +z, m.mi);
+}
+function guiColorSet(o, r, g, b, a) {
+const m = RT.findMethod(RT.rw(o), "set_color", 1); if (!m) throw new Error("no set_color");
+const f = RT.M["dynCall_vffffi"]; if (!f) throw new Error("dynCall_vffffi missing in this build");
+f(m.fn, o, +r, +g, +b, +a, m.mi);
+}
+function guiSelect(e) {
+guiState.sel = e;
+const t = guiGet(e.addr, "get_text"); if (typeof t === "string") guiEd.text = t;
+const c = guiGet(e.addr, "get_color"); if (Array.isArray(c) && c.length >= 4) { guiEd.r = c[0]; guiEd.g = c[1]; guiEd.b = c[2]; guiEd.a = c[3]; }
+const tr = guiGet(e.addr, "get_transform") >>> 0; if (tr) e.tr = tr;
+if (e.tr) {
+const p = guiGet(e.tr, "get_position"); if (Array.isArray(p) && p.length >= 3) { guiEd.x = p[0]; guiEd.y = p[1]; guiEd.z = p[2]; }
+const s = guiGet(e.tr, "get_localScale"); if (Array.isArray(s) && s.length >= 3) { guiEd.sx = s[0]; guiEd.sy = s[1]; guiEd.sz = s[2]; }
+}
+guiRenderEd(); guiRender(); guiDraw();
+}
+function guiApply() {
+const e = guiState.sel; if (!e) { say("select an element first"); return; }
+try { const m = RT.findMethod(RT.rw(e.addr), "set_text", 1); if (m) RT.invokeF(m, e.addr, [String(guiEd.text)]); } catch (x) {}
+try { guiColorSet(e.addr, guiEd.r, guiEd.g, guiEd.b, guiEd.a); } catch (x) {}
+const tr = guiGet(e.addr, "get_transform") >>> 0;
+if (tr) { try { guiVec3Set(tr, "set_position", guiEd.x, guiEd.y, guiEd.z); } catch (x) {} try { guiVec3Set(tr, "set_localScale", guiEd.sx, guiEd.sy, guiEd.sz); } catch (x) {} }
+say("applied to " + e.name);
+}
+function guiCenter() { const p = findPlayerPtr(); if (!p) { say("player not found"); return; } const tr = guiGet(p, "get_transform") >>> 0; if (!tr) return; const pos = guiGet(tr, "get_position"); if (Array.isArray(pos) && pos.length >= 3) { guiCam.x = pos[0]; guiCam.y = pos[1]; guiCam.z = pos[2]; guiDraw(); say("view centered on player"); } }
+const guiOut = el("div", { className: "tbl" });
+function guiRender() {
+guiOut.innerHTML = "";
+guiOut.appendChild(el("div", { className: "tr" }, [el("div", { className: "nm", textContent: guiState.busy ? "scanning… " + guiState.done + " objects checked, " + guiState.hits + " UI elements" : guiState.list.length + " UI elements" + (guiState.done ? " (scanned " + guiState.done + ")" : "") })]));
+const q = guiState.q;
+let shown = 0;
+for (const e of guiState.list) {
+if (q && e.name.toLowerCase().indexOf(q) < 0 && e.cls.toLowerCase().indexOf(q) < 0) continue;
+if (shown++ >= 400) { guiOut.appendChild(el("div", { className: "tr" }, [el("div", { className: "nm", textContent: "…more, refine the filter" })])); break; }
+const row = el("div", { className: "tr" }, [el("div", { className: "nm link", textContent: e.name + "  •  " + e.cls.split(".").pop() })]);
+row.onclick = () => guiSelect(e);
+if (guiState.sel === e) row.style.color = "#ffd60a";
+guiOut.appendChild(row);
+}
+}
+const guiEdHead = el("div", { className: "nm", textContent: "no selection" });
+const guiTextIn = el("input", { type: "text", className: "txt", spellcheck: false });
+guiTextIn.onchange = () => { guiEd.text = guiTextIn.value; };
+const guiEls = {};
+["r", "g", "b", "a", "x", "y", "z", "sx", "sy", "sz"].forEach((k) => {
+const i = el("input", { type: "text", className: "num s", spellcheck: false });
+i.onchange = () => { const v = Number(i.value); if (isFinite(v)) guiEd[k] = v; else i.value = guiEd[k]; };
+guiEls[k] = i;
+});
+const guiRow3 = (t, a, b, c) => R_(lbl(t), el("div", { className: "row", style: "gap:4px" }, [guiEls[a], guiEls[b], guiEls[c]]));
+const guiEdOut = el("div", { className: "tbl" }, [
+guiEdHead,
+R_(lbl("text"), guiTextIn),
+R_(lbl("color r g b a"), el("div", { className: "row", style: "gap:4px" }, [guiEls.r, guiEls.g, guiEls.b, guiEls.a])),
+guiRow3("position x y z", "x", "y", "z"),
+guiRow3("scale x y z", "sx", "sy", "sz"),
+el("div", { className: "btns" }, [btn("Apply", guiApply, "hot"), btn("Refresh", () => { if (guiState.sel) guiSelect(guiState.sel); }, ""), btn("Center on player", guiCenter, "")])
+]);
+function guiRenderEd() {
+const e = guiState.sel;
+guiEdHead.textContent = e ? e.name + "  •  " + e.cls.split(".").pop() : "no selection";
+guiTextIn.value = guiEd.text;
+for (const k in guiEls) guiEls[k].value = guiEd[k];
+}
+const guiCv = document.createElement("canvas");
+guiCv.style.cssText = "width:100%;height:240px;background:#120e06;border-radius:8px;cursor:crosshair;display:block";
+const gctx = guiCv.getContext("2d");
+function guiProj(e) {
+const w = guiCv.width, h = guiCv.height;
+const rx = e.pos[0] - guiCam.x, ry = e.pos[1] - guiCam.y, rz = e.pos[2] - guiCam.z;
+const f = 1 / (1 + Math.max(0, rz) * 0.002);
+const k = guiCam.zoom * 20 * f;
+return { x: w / 2 + rx * k, y: h / 2 - ry * k, r: Math.max(2, Math.min(24, (Math.abs(e.scl[0]) + Math.abs(e.scl[1]) + Math.abs(e.scl[2])) / 3 * 8 * f * guiCam.zoom)), f };
+}
+function guiDraw() {
+const w = guiCv.clientWidth || 300, h = guiCv.clientHeight || 240;
+if (guiCv.width !== w || guiCv.height !== h) { guiCv.width = w; guiCv.height = h; }
+gctx.clearRect(0, 0, w, h);
+gctx.strokeStyle = "rgba(255,214,10,.12)"; gctx.lineWidth = 1;
+for (let gx = 0; gx <= w; gx += 40) { gctx.beginPath(); gctx.moveTo(gx, 0); gctx.lineTo(gx, h); gctx.stroke(); }
+for (let gy = 0; gy <= h; gy += 40) { gctx.beginPath(); gctx.moveTo(0, gy); gctx.lineTo(w, gy); gctx.stroke(); }
+gctx.fillStyle = "rgba(247,239,220,.55)"; gctx.font = "10px system-ui";
+gctx.fillText("3D view: x/y plotted, z = depth. wheel = zoom, drag an element = move it in the view plane (applies on release)", 6, 12);
+for (const e of guiState.list) {
+const p = guiProj(e); if (!p) continue;
+if (p.x < -40 || p.x > w + 40 || p.y < -40 || p.y > h + 40) continue;
+gctx.beginPath(); gctx.arc(p.x, p.y, p.r, 0, 6.2832);
+gctx.fillStyle = guiState.sel === e ? "#ffd60a" : "rgba(255,159,10,.75)";
+gctx.fill();
+if (guiState.sel === e) { gctx.strokeStyle = "#fff"; gctx.stroke(); }
+}
+}
+let guiDrag = null;
+guiCv.addEventListener("mousedown", (ev) => {
+const r = guiCv.getBoundingClientRect(); const mx = ev.clientX - r.left, my = ev.clientY - r.top;
+let best = null, bd = 1e9;
+for (const e of guiState.list) { const p = guiProj(e); const d = (p.x - mx) * (p.x - mx) + (p.y - my) * (p.y - my); if (d < bd && d < (p.r + 6) * (p.r + 6)) { bd = d; best = e; } }
+if (best) { guiSelect(best); guiDrag = { e: best, mx, my, ox: guiEd.x, oy: guiEd.y, wpp: 1 / (20 * guiCam.zoom * guiProj(best).f) }; }
+});
+window.addEventListener("mousemove", (ev) => {
+if (!guiDrag) return;
+const r = guiCv.getBoundingClientRect();
+guiEd.x = guiDrag.ox + (ev.clientX - r.left - guiDrag.mx) * guiDrag.wpp;
+guiEd.y = guiDrag.oy - (ev.clientY - r.top - guiDrag.my) * guiDrag.wpp;
+guiRenderEd(); guiDraw();
+});
+window.addEventListener("mouseup", () => { if (guiDrag) { guiApply(); guiDrag = null; } });
+guiCv.addEventListener("wheel", (ev) => { ev.preventDefault(); guiCam.zoom *= ev.deltaY > 0 ? 0.9 : 1.1; guiDraw(); }, { passive: false });
+const guiFilter = el("input", { type: "text", className: "txt", placeholder: "filter by name or class", spellcheck: false });
+guiFilter.oninput = () => { guiState.q = guiFilter.value.trim().toLowerCase(); guiRender(); };
+const pageGui = el("div", { className: "pg hide" }, [
+card("GUI scanner", [
+el("div", { className: "note", textContent: "Async scan of live UI elements (UnityEngine.UI.Text/Image, UILabel, Canvas…). Only objects that are activeInHierarchy AND not destroyed (m_CachedPtr != 0) are kept. Yields every 50 objects so the browser never freezes." }),
+el("div", { className: "btns" }, [btn("Scan GUI objects", scanGUI, "", "scan"), btn("Clear", () => { guiState.list = []; guiState.sel = null; guiRender(); guiRenderEd(); guiDraw(); }, "", "trash")]),
+guiFilter, guiOut
+], "list"),
+card("Editor", [guiEdOut], "paint"),
+card("3D view", [guiCv], "cube")
+]);
+
 // ===== PREFS =====
 const logOut = el("pre", { className: "out" });
 const pagePrefs = el("div", { className: "pg hide" }, [
@@ -1967,17 +2137,18 @@ el("div", { className: "note", textContent: "Drag the header to move the panel a
 card("Log", [logOut, el("div", { className: "btns" }, [btn("Copy log", () => copyText(LOG.join("\n")), "", "copy")])], "list")
 ]);
 
-const TABS = [["Spawn", "spawn", pageSpawn], ["Scan", "scan", pageScan], ["Dev", "dev", pageDev], ["Explore", "explorer", pageEx], ["Code", "console", pageCon], ["Save", "save", pageSave], ["Prefs", "prefs", pagePrefs]];
+const TABS = [["Spawn", "spawn", pageSpawn], ["Scan", "scan", pageScan], ["GUI", "list", pageGui], ["Dev", "dev", pageDev], ["Explore", "explorer", pageEx], ["Code", "console", pageCon], ["Save", "save", pageSave], ["Prefs", "prefs", pagePrefs]];
 const pill = el("div", { className: "pill" }); pill.style.width = "calc((100% - 6px) / " + TABS.length + ")";
 const tabEls = TABS.map(([name, ic], i) => { const t = el("div", { className: "tab" }, [icon(ic, 16), D.createTextNode(name)]); t.onclick = () => setTab(i); return t; });
 const setTab = (i) => {
 S.tab = i; persist();
-uiOpen.explorer = i === 3; uiOpen.spawn = i === 0; uiOpen.scan = i === 1;
+uiOpen.explorer = i === 4; uiOpen.spawn = i === 0; uiOpen.scan = i === 1; uiOpen.gui = i === 2;
 pill.style.transform = "translateX(" + (i * 100) + "%)";
 tabEls.forEach((t, j) => t.classList.toggle("on", j === i));
 TABS.forEach(([, , p], j) => p.classList.toggle("hide", j !== i));
 if (i === 0) { chunkRender(); pkRender(); }
-if (i === 3) { exClasses(); exRender(); if (ex.view === "classes") clsRender(); }
+if (i === 2 && !guiState.list.length && !guiState.busy) scanGUI();
+if (i === 4) { exClasses(); exRender(); if (ex.view === "classes") clsRender(); }
 };
 BODY = el("div", { className: "b" }, TABS.map((t) => t[2]));
 const rs = el("div", { className: "rs", title: "drag to resize" });
