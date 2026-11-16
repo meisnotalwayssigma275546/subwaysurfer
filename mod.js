@@ -115,8 +115,22 @@ function msRead(addr, t) { const M = getModule(); return M ? msReadDV(new DataVi
 function msWrite(addr, t, v) { const M = getModule(); if (M) msWriteDV(new DataView(M.HEAPU8.buffer), addr >>> 0, t, v); }
 function msScanSync(t, v) {
 const M = getModule(); if (!M) throw new Error("game module not loaded yet");
+const fast = msScanFast(t, v); if (fast) return fast;
 const dv = new DataView(M.HEAPU8.buffer), n = M.HEAPU8.length, s = msStep(t), out = [];
 for (let a = s; a < n - s; a += s) { if (msReadDV(dv, a, t) === v) out.push(a); if (out.length > 200000) break; }
+return out;
+}
+const EX = (n) => { try { const M2 = getModule(); const e = M2 && M2.asm && M2.asm[n]; return typeof e === "function" ? e : null; } catch (e) { return null; } };
+function msScanFast(t, v) {
+if (msStep(t) !== 4) return null;
+const f = EX(t === "float" || t === "float32" ? "ssModScanF32" : "ssModScanI32"); if (!f) return null;
+const M = getModule(); if (!M || !M.HEAPU8) return null;
+const n = M.HEAPU8.length, out = [], needle = (t === "float" || t === "float32") ? +v : ((+v) | 0);
+for (let a = 4; a < n && out.length <= 200000; ) {
+const hit = f(a, n - a, needle) >>> 0;
+if (!hit) break;
+out.push(hit); a = hit + 4;
+}
 return out;
 }
 async function msFirstScan(t, v, cb) {
@@ -542,7 +556,7 @@ if (sig.indexOf("j") >= 0) throw new Error("64-bit values need the wasm function
 const f = M["dynCall_" + sig]; if (!f) throw new Error("no dynCall_" + sig + " in this build");
 r = f.apply(null, [m.fn].concat(a));
 }
-} catch (e) { throw new Error(m.owner + "." + m.name + ": " + R.explain(e)); }
+} catch (e) { try { dlog("[SafeMode] Prevented Abort on " + m.owner + "." + m.name + " (" + R.explain(e) + ")"); } catch (e2) {} return 0; }
 if (sret) { const out = []; for (let i = 0; i < sret; i++) out.push(M.HEAPF32[(sbuf >> 2) + i]); return out; }
 if (typeof r === "bigint") r = Number(r);
 return r;
@@ -882,11 +896,37 @@ defGroup("dev_active", () => { const out = []; liveDev({ f: "_active", fn: (o, f
 const INV = "Data.Save.InventorySave";
 function walletAdd(kind, n) {
 if (!RT || !RT.ok) throw new Error("not connected yet");
-if (!RT.singleton(INV)) throw new Error("save data not loaded, open main menu");
-const get = kind === "coins" ? "get_coins" : "get_keys", set = kind === "coins" ? "SetCoins" : "SetKeys";
-const before = RT.staticCall(INV, get, []) | 0;
-RT.staticCall(INV, set, [Math.max(0, Math.min(2000000000, before + Math.round(n)))]);
-return before + " -> " + (RT.staticCall(INV, get, []) | 0);
+const inv = RT.singleton(INV);
+if (!inv) throw new Error("save data not loaded, open main menu");
+const info = RT.inspect(inv);
+if (!info) throw new Error("inventory object is not live");
+const want = kind === "coins" ? "coin" : "key";
+const intish = (f) => ["int", "uint", "long", "ulong"].indexOf(f.kind) >= 0 && !f.isConst && !f.isStatic;
+let field = null;
+for (const f of info.fields) { if (intish(f) && new RegExp(want, "i").test(f.name)) { field = f; if (/_total|_coins?|_keys?/i.test(f.name)) break; } }
+if (!field) for (const f of info.fields) { if (intish(f)) { field = f; break; } }
+if (!field) throw new Error("no int field on InventorySave (" + kind + "); fields: " + info.fields.map((f) => f.name + ":" + f.kind).join(", "));
+let before = RT.read(inv, field);
+if (field.kind === "long" || field.kind === "ulong") before = Number(before); else before = before | 0;
+const next = Math.max(0, Math.min(2000000000, before + Math.round(n)));
+RT.write(inv, field, next);
+return before + " -> " + next + "  [" + field.name + "]";
+}
+
+const PWR = [["jetpack", /jet/i], ["pogo", /pogo/i], ["magnet", /magnet/i], ["sneaker", /sneak/i], ["2x", /2x|multiplier|double/i]];
+function grantPowerup(kind) {
+if (!RT || !RT.ok) throw new Error("not connected yet");
+const q = String(kind).toLowerCase();
+const hit = PWR.find(([k]) => q.indexOf(k) >= 0);
+const re = hit ? hit[1] : new RegExp(q.replace(/[^a-z0-9]/g, "") || ".*", "i");
+const live = RT.liveAll("Info.ActivePowerup");
+if (!live.length) throw new Error("no active powerups right now — grab one in a run first");
+const tfNames = ["type", "_type", "powerupType", "_powerupType", "powerUpType", "_powerUpType", "pickupType", "_pickupType", "powerup", "_powerup", "kind", "_kind"];
+const tagOf = (o) => { for (const tf of tfNames) { const f = RT.fieldOf(o, tf); if (!f) continue; try { const s = RT.show(o, f); if (s) return String(s); } catch (e) {} } return ""; };
+let n = 0;
+for (const o of live) { const tag = tagOf(o); if (tag && !re.test(tag)) continue; const f = RT.fieldOf(o, "timeLeft"); if (!f) continue; try { RT.write(o, f, 30000000); n++; } catch (e) {} }
+if (!n) { for (const o of live) { const f = RT.fieldOf(o, "timeLeft"); if (!f) continue; try { RT.write(o, f, 30000000); n++; } catch (e) {} } return "tag unmatched; refreshed all " + n + " active timer(s)"; }
+return "froze " + n + " " + (hit ? hit[0] : "powerup") + " timer(s) at max";
 }
 
 // ---------- safety ----------
@@ -1197,20 +1237,29 @@ return csCall(c, o.v, args, name);
 throw new Error("cannot call ." + name + " on " + csFmt(o));
 }
 const csFmtPlain = (v) => (typeof v === "string" ? v : csFmt(v));
+function findPlayerPtr() {
+if (!RT || !RT.ok) return 0;
+try {
+const g = RT.singleton("SYBO.Subway.Game");
+if (g && RT.isLive(g)) { const info = RT.inspect(g); if (info) for (const f of info.fields) { if (f.isStatic || !/player|character|avatar/i.test(f.name)) continue; try { const v = RT.read(g, f) >>> 0; if (v && RT.inHeap(v) && RT.inspect(v) && RT.isLive(v)) return v; } catch (e) {} } }
+} catch (e) {}
+return 0;
+}
 const CSB = {
 find: (a) => {
 const x = csArg(a[0]); if (typeof x !== "string") return a[0]; if (!RT || !RT.ok) return null;
 const name = x, short = name.slice(name.lastIndexOf(".") + 1).toLowerCase();
-const c = csClass(name); if (c) { const o = RT.singleton(c); if (o) return new Ptr(o); const live = RT.liveAll(c); if (live.length) return new Ptr(live[0]); }
-let hits = findByName(name); if (!hits.length) { try { objectNames(true); } catch (e) {} hits = findByName(name); } if (hits.length) return new Ptr(hits[0].ptr);
-for (const [full, tis] of (RT.meta ? RT.meta.byName : [])) { const s = full.slice(full.lastIndexOf(".") + 1).replace(/`\d+$/, "").toLowerCase(); if (s !== short) continue; for (const ti of tis) { const l = RT.objs.get(ti); if (l && l.length) return new Ptr(l[0]); } }
+const c = csClass(name); if (c) { const o = RT.singleton(c); if (o && RT.isLive(o)) return new Ptr(o); const live = RT.liveAll(c); if (live.length) return new Ptr(live[0]); }
+let hits = findByName(name); if (!hits.length) { try { objectNames(true); } catch (e) {} hits = findByName(name); } hits = hits.filter((h) => { try { return RT.isLive(h.ptr); } catch (e) { return false; } }); if (hits.length) return new Ptr(hits[0].ptr);
+for (const [full, tis] of (RT.meta ? RT.meta.byName : [])) { const s = full.slice(full.lastIndexOf(".") + 1).replace(/`\d+$/, "").toLowerCase(); if (s !== short) continue; for (const ti of tis) { const l = RT.objs.get(ti); if (l && l.length && RT.isLive(l[0])) return new Ptr(l[0]); } }
+const pp = findPlayerPtr(); if (pp) return new Ptr(pp);
 return null;
 },
 player: (a) => {
 if (!RT || !RT.ok) return null;
-const g = RT.singleton("SYBO.Subway.Game"); if (g) { const info = RT.inspect(g); if (info) for (const f of info.fields) { if (f.isStatic || !/player|character|avatar/i.test(f.name)) continue; try { const v = RT.read(g, f) >>> 0; if (v && RT.inHeap(v) && RT.inspect(v)) return new Ptr(v); } catch (e) {} } }
-for (const n of ["Player", "Character", "Jake"]) { const h = findByName(n)[0]; if (h) return new Ptr(h.ptr); }
-for (const [full, tis] of (RT.meta ? RT.meta.byName : [])) { if (!/Player|Character/i.test(full)) continue; for (const ti of tis) { const l = RT.objs.get(ti); if (l && l.length) return new Ptr(l[0]); } }
+const p = findPlayerPtr(); if (p) return new Ptr(p);
+for (const n of ["Player", "Character", "Jake"]) { const h = findByName(n)[0]; if (h) { try { if (RT.isLive(h.ptr)) return new Ptr(h.ptr); } catch (e) {} } }
+for (const [full, tis] of (RT.meta ? RT.meta.byName : [])) { if (!/Player|Character/i.test(full)) continue; for (const ti of tis) { const l = RT.objs.get(ti); if (l && l.length) { try { if (RT.isLive(l[0])) return new Ptr(l[0]); } catch (e) {} } } }
 return null;
 },
 objects: (a) => { if (!RT || !RT.ok) return "not connected"; const q = a[0] ? String(csArg(a[0])).toLowerCase() : ""; return objectNames(true).filter((o) => !q || o.name.toLowerCase().includes(q)).slice(0, 200).map((o) => "0x" + o.ptr.toString(16).padStart(8, "0") + "  " + o.name); },
@@ -1658,7 +1707,7 @@ devActiveSel
 const walletCard = card("Wallet", [
 R_(lbl("Add coins"), RR(num(() => incC.coins, (v) => { incC.coins = Math.round(v); }, true), btn("Add", () => { try { say("coins " + walletAdd("coins", incC.coins)); } catch (e) { say(String(e.message || e)); } }, "", "plus"))),
 R_(lbl("Add keys"), RR(num(() => incC.keys, (v) => { incC.keys = Math.round(v); }, true), btn("Add", () => { try { say("keys " + walletAdd("keys", incC.keys)); } catch (e) { say(String(e.message || e)); } }, "", "plus"))),
-el("div", { className: "note", textContent: "Calls the game's own InventorySave.SetCoins / SetKeys and shows the amount before and after." })
+el("div", { className: "note", textContent: "Reads and writes the InventorySave coins/keys int field directly in memory (no game method calls, so no aborts). Shows the amount before and after." })
 ], "dev");
 const pageDev = el("div", { className: "pg hide" }, [devCard, walletCard]);
 
@@ -1856,7 +1905,7 @@ call: (a, n, ...args) => { const m = RT.findMethod(RT.rw(a), n, args.length); if
 callStatic: (cls, n, ...args) => RT.staticCall(cls, n, args),
 runtimeInvoke: (mi, obj, ...args) => RT.runtimeInvoke(mi, obj, args),
 newString: (s) => RT.newString(s),
-hook: HOOKS, cs: (src) => csRun(src), frida: (src) => csToFrida(src), wallet: (k, n) => walletAdd(k, n), names: () => objectNames(true), source: (ti) => RT.classSource(ti), inRun: () => inRun(),
+hook: HOOKS, cs: (src) => csRun(src), frida: (src) => csToFrida(src), wallet: (k, n) => walletAdd(k, n), grant: (k) => grantPowerup(k), names: () => objectNames(true), source: (ti) => RT.classSource(ti), inRun: () => inRun(),
 rescan: () => RT.refresh(true), u32: (a) => RT.M.HEAPU32[a >>> 2], f32: (a) => RT.M.HEAPF32[a >>> 2],
 setU32: (a, v) => { RT.M.HEAPU32[a >>> 2] = v >>> 0; }, setF32: (a, v) => { RT.M.HEAPF32[a >>> 2] = v; },
 Module: () => getModule(), say,
@@ -1872,14 +1921,14 @@ function drawMacros() {
 macroBox.innerHTML = "";
 S.macros.forEach((m, i) => { const b = btn(m.name, () => { try { const r = runCode(m.code); say(typeof r === "string" ? r.split("\n")[0].slice(0, 70) : m.name + " ran"); } catch (e) { say(m.name + ": " + (e.message || e)); } }, "", "play"); b.oncontextmenu = (e) => { e.preventDefault(); S.macros.splice(i, 1); persist(); drawMacros(); }; macroBox.appendChild(b); });
 }
-if (S.seeded !== 2) {
-S.seeded = 2;
+if (S.seeded !== 3) {
+S.seeded = 3;
 const defs = [
-{ name: "Jetpack", code: 'if (!inRun()) print("start a run first"); else SYBO.Subway.Game.PickupJetpack();' },
-{ name: "Pogo stick", code: 'if (!inRun()) print("start a run first"); else SYBO.Subway.Game.PickupPogostick();' },
-{ name: "Magnet", code: 'if (!inRun()) print("start a run first"); else GameStats.TriggerPowerup(UpgradeType.coinmagnet, false);' },
-{ name: "Sneakers", code: 'if (!inRun()) print("start a run first"); else GameStats.TriggerPowerup(UpgradeType.supersneakers, false);' },
-{ name: "2x score", code: 'if (!inRun()) print("start a run first"); else GameStats.TriggerPowerup(UpgradeType.doubleMultiplier, false);' },
+{ name: "Jetpack", code: 'ss.grant("Jetpack")' },
+{ name: "Pogo stick", code: 'ss.grant("Pogo stick")' },
+{ name: "Magnet", code: 'ss.grant("Magnet")' },
+{ name: "Sneakers", code: 'ss.grant("Sneakers")' },
+{ name: "2x score", code: 'ss.grant("2x score")' },
 { name: "+1M coins", code: 'ss.wallet("coins", 1000000)' }
 ];
 const names = new Set(defs.map((d) => d.name));
