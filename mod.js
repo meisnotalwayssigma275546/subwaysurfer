@@ -518,6 +518,7 @@ if (R.strCache.size > 800) R.strCache.clear();
 R.strCache.set(s, p);
 return p;
 };
+const safeLogTally = {};
 R.invoke = (m, thisPtr, args) => {
 args = args || [];
 if (m.pars.length !== args.length) throw new Error(m.name + " needs " + m.pars.length + " argument(s)");
@@ -556,7 +557,7 @@ if (sig.indexOf("j") >= 0) throw new Error("64-bit values need the wasm function
 const f = M["dynCall_" + sig]; if (!f) throw new Error("no dynCall_" + sig + " in this build");
 r = f.apply(null, [m.fn].concat(a));
 }
-} catch (e) { try { dlog("[SafeMode] Prevented Abort on " + m.owner + "." + m.name + " (" + R.explain(e) + ")"); } catch (e2) {} return 0; }
+} catch (e) { try { const key = m.owner + "." + m.name; safeLogTally[key] = (safeLogTally[key] || 0) + 1; const n = safeLogTally[key]; if (n <= 2) dlog("[SafeMode] Prevented Abort on " + key + " (" + R.explain(e) + ")" + (n === 2 ? " — further identical aborts will be silenced" : "")); } catch (e2) {} return 0; }
 if (sret) { const out = []; for (let i = 0; i < sret; i++) out.push(M.HEAPF32[(sbuf >> 2) + i]); return out; }
 if (typeof r === "bigint") r = Number(r);
 return r;
@@ -864,6 +865,82 @@ return rows;
 }
 function pickupOnly(row, rows) { for (const r of rows) ovSet("pickupweights", r.addr, r.fw, r === row ? Math.max(100, RT.read(r.addr, r.fw)) : 0); say("only " + row.name + " will spawn"); }
 
+// ---------- double coins FX ----------
+const coinFx = { auto: false, clones: new Set(), side: 1.5 };
+function unityInstantiate(obj) {
+for (const full of ["UnityEngine.Object", "Object"]) { try { const r = RT.staticCall(full, "Instantiate", [obj]); if (r) return r; } catch (e) {} }
+return 0;
+}
+function unityDestroy(obj) {
+for (const full of ["UnityEngine.Object", "Object"]) { try { RT.staticCall(full, "Destroy", [obj]); return true; } catch (e) {} }
+return false;
+}
+function objTransform(o) { const m = RT.findMethod(RT.rw(o), "get_transform", 0); if (!m) return 0; try { return (RT.invokeF(m, o, []) >>> 0) || 0; } catch (e) { return 0; } }
+function objPos(o) { const t = objTransform(o); if (!t) return null; const m = RT.findMethod(RT.rw(t), "get_position", 0); if (!m) return null; try { const p = RT.invokeF(m, t, []); return Array.isArray(p) && p.length >= 3 ? p : null; } catch (e) { return null; } }
+function objSetPos(o, x, y, z) { const t = objTransform(o); if (!t) return false; try { guiVec3Set(t, "set_position", x, y, z); return true; } catch (e) { return false; } }
+function objEulerY(o) { const t = objTransform(o); if (!t) return null; const m = RT.findMethod(RT.rw(t), "get_eulerAngles", 0); if (!m) return null; try { const e = RT.invokeF(m, t, []); return Array.isArray(e) && e.length >= 2 ? e[1] : null; } catch (e2) { return null; } }
+function laneRightVec() {
+let yaw = null;
+try { const pp = findPlayerPtr(); if (pp) yaw = objEulerY(pp); } catch (e) {}
+if (yaw === null || !isFinite(yaw)) yaw = 0;
+const r = yaw * Math.PI / 180;
+return [Math.cos(r) * coinFx.side, 0, -Math.sin(r) * coinFx.side];
+}
+function findCoinObjs() {
+if (!RT || !RT.ok) return [];
+for (const n of ["SYBO.Subway.Pickups.Coin", "Pickups.Coin", "Coin"]) {
+try { const l = RT.liveAll(n); if (l && l.length) return l; } catch (e) {}
+}
+const out = [];
+try {
+for (const [full, tis] of RT.meta.byName) {
+if (!/coin/i.test(full)) continue;
+for (const ti of tis) for (const o of (RT.objs.get(ti) || [])) { try { if (RT.isLive(o) && isUnityObj(o)) out.push(o); } catch (e) {} }
+}
+} catch (e) {}
+return out;
+}
+function doubleCoinsOnce(silent) {
+if (!RT || !RT.ok) throw new Error("not connected yet");
+const coins = findCoinObjs().filter((c) => !coinFx.clones.has(c));
+if (!coins.length) { if (!silent) say("no coins on the track right now"); return 0; }
+const rv = laneRightVec();
+let n = 0;
+for (const c of coins.slice(0, 300)) {
+let cl = 0;
+try { cl = unityInstantiate(c) >>> 0; } catch (e) { cl = 0; }
+if (!cl) continue;
+const p = objPos(c);
+if (!p) { try { unityDestroy(cl); } catch (e2) {} continue; }
+try { if (!objSetPos(cl, p[0] + rv[0], p[1], p[2] + rv[2])) { /* keep it next to the original anyway */ } } catch (e3) {}
+coinFx.clones.add(cl); n++;
+}
+if (!silent) say(n ? "duplicated " + n + " coin(s) one lane to the side (" + coinFx.clones.size + " clone(s) total)" : "could not clone coins — UnityEngine.Object.Instantiate is unavailable in this build");
+return n;
+}
+function clearCoinClones() {
+let n = 0;
+for (const c of Array.from(coinFx.clones)) { try { if (unityDestroy(c)) n++; } catch (e) {} coinFx.clones.delete(c); }
+say("removed " + n + " duplicated coin(s)");
+}
+function powerupActive(re) {
+try {
+for (const o of RT.liveAll("Info.ActivePowerup")) {
+let tag = "";
+for (const tf of ["type", "_type", "powerupType", "_powerupType", "powerUpType", "_powerUpType", "pickupType", "_pickupType", "powerup", "_powerup", "kind", "_kind"]) {
+const f = RT.fieldOf(o, tf); if (!f) continue;
+try { const s = RT.show(o, f); if (s) { tag = String(s); break; } } catch (e) {}
+}
+if (tag && re.test(tag)) return true;
+}
+} catch (e) {}
+return false;
+}
+setInterval(() => {
+if (!coinFx.auto || !RT || !RT.ok) return;
+try { if (powerupActive(/2x|multiplier|double/i)) doubleCoinsOnce(true); } catch (e) {}
+}, 1000);
+
 // ---------- powerup tuning ----------
 const TUNE = [
 { id: "ptimer", title: "Powerup timers", sub: "seconds left on every active powerup", def: 30000000, cls: [["Info.ActivePowerup", "timeLeft"]] },
@@ -880,6 +957,19 @@ if (!RT || !RT.ok) { say("not connected yet"); return false; }
 if (RT.liveAll(DEVC).length) return true;
 const k = RT.klassByName(DEVC);
 if (!k) { say("DebugSettings class not indexed yet — wait for the first scan"); return false; }
+// 1) try the game's own zero-arg factory/accessor methods first — the game will then
+//    track the instance itself and every toggle we write will actually be read
+let ms = []; try { ms = RT.methodsChain(k); } catch (e) {}
+const factories = (ms || []).filter((m) => m.static && m.pars.length === 0 && /instance|current|default|create|setup|build|make|get|load/i.test(m.name));
+for (const m of factories.slice(0, 10)) {
+  let r;
+  try { r = R.invokeF(m, 0, []); } catch (e) { dlog("dev: " + m.name + "() aborted: " + (e.message || e)); continue; }
+  dlog("dev: factory " + m.name + "() -> " + (typeof r === "number" ? hex(r >>> 0) : String(r)));
+  if (RT.liveAll(DEVC).length) { say("DebugSettings created via " + m.name + "() — toggles now stick"); return true; }
+}
+if (RT.liveAll(DEVC).length) return true;
+// 2) no factory worked — the release build likely stripped debug code entirely.
+//    Manual allocation only sets flags the game never reads. Say so honestly instead of lying.
 try {
 const fs = RT.klassFields(k) || [];
 let sz = 16;
@@ -888,8 +978,8 @@ const p = RT.M._malloc(sz + 16);
 const dv = new DataView(RT.M.HEAPU8.buffer);
 dv.setInt32(p, k, true);
 for (const f of fs) { if (f.isStatic) continue; try { if (f.kind === "bool") dv.setUint8(p + (f.off || 0), 1); } catch (e) {} }
-RT.refresh(false);
-say("DebugSettings allocated manually (" + hex(p) + ") — switch a setting on again");
+dlog("dev: DebugSettings allocated manually (0x" + (p >>> 0).toString(16) + ") — WARNING: release builds do not read this object; only static debug flags (if any) can work");
+say("No debug factory found — the release build never reads DebugSettings, so invincible/free-cam cannot stick. Static debug flags (if any) are toggled below.");
 return true;
 } catch (e) { say("error: " + (e.message || e)); return false; }
 }
@@ -901,8 +991,10 @@ const DEV = [
 { f: "_useQueuedEnvironmentKinds", title: "Use queued environments", sub: "force the world look queue", set: "set_UseQueuedEnvironmentKinds" }
 ];
 const liveDev = (cb) => { for (const o of RT.liveAll(DEVC)) { try { const f = RT.fieldOf(o, cb.f); if (f) cb.fn(o, f); } catch (e) {} } };
-DEV.forEach((d) => defGroup("dev" + d.f, () => { const out = []; liveDev({ f: d.f, fn: (o, f) => out.push([o, f, f.kind === "bool" ? true : 1]) }); return out; }, null, devEnsure));
-defGroup("dev_active", () => { const out = []; liveDev({ f: "_active", fn: (o, f) => out.push([o, f, f.kind === "bool" ? true : (S.vals.devActive || 1)]) }); return out; }, null, devEnsure);
+const staticDev = (cb) => { const k = RT.klassByName(DEVC); if (!k) return; let fs = []; try { fs = RT.klassFields(k) || []; } catch (e) { return; } for (const f of fs) { if (!f.isStatic || !f.name) continue; if (f.name !== cb.f && f.name !== "_" + cb.f.replace(/^_/, "")) continue; cb.fn(0, f); } };
+const devTarget = (cb) => { liveDev(cb); staticDev(cb); };
+DEV.forEach((d) => defGroup("dev" + d.f, () => { const out = []; const one = { f: d.f, fn: (o, f) => out.push([o, f, f.kind === "bool" ? true : 1]) }; devTarget(one); return out; }, null, devEnsure));
+defGroup("dev_active", () => { const out = []; const one = { f: "_active", fn: (o, f) => out.push([o, f, f.kind === "bool" ? true : (S.vals.devActive || 1)]) }; devTarget(one); return out; }, null, devEnsure);
 
 // ---------- wallet ----------
 const INV = "Data.Save.InventorySave";
@@ -911,34 +1003,61 @@ if (!RT || !RT.ok) throw new Error("not connected yet");
 const want = kind === "coins" ? "coin" : "key";
 const re = new RegExp(want, "i");
 const intish = (f) => ["int", "uint", "long", "ulong", "short", "ushort", "byte", "float", "double"].indexOf(f.kind) >= 0;
-const inv = RT.singleton(INV);
-const found = [];
+const CLS_HINT = /save|inventory|wallet|currency|profile|pocket|balance|bank|account|shop|store|coin|key/i;
 const rdV = (obj, f) => { try { const v = RT.read(obj, f); if (v === undefined) return null; if (f.kind === "long" || f.kind === "ulong") return Number(v); if (f.kind === "int" || f.kind === "uint") return v | 0; if (f.kind === "float" || f.kind === "double") return +v; return v; } catch (e) { return null; } };
-const commonNames = ["_coins", "_keys", "_totalCoins", "_totalKeys", "_balance", "_money", "_curr", "_score", "_multiplier"];
-const addCommon = (obj, f) => { for (const cn of commonNames) { if (f.name === cn || f.name.endsWith(cn)) { found.push({ f, obj, tag: "inst", v: intish(f) ? rdV(obj, f) : null }); return; } } };
-if (inv) { try { const info = RT.inspect(inv); if (info) for (const f of info.fields) { if (f.isConst) continue; found.push({ f, obj: inv, tag: "inst", v: intish(f) ? rdV(inv, f) : null }); } } catch (e) {} }
-const k = RT.klassByName ? RT.klassByName(INV) : 0;
-if (k) for (const f of RT.klassFields(k)) { if (f.isConst || !intish(f)) continue; found.push({ f, obj: 0, tag: "static", v: rdV(0, f) }); }
-// Also scan instance fields for common alternate names
-if (inv) { try { const info = RT.inspect(inv); if (info) for (const f of info.fields) { if (f.isConst) continue; addCommon(inv, f); } } catch (e) {} }
-const dump = () => {
-  const lines = [];
-  if (inv) { try { const info = RT.inspect(inv); if (info) for (const f of info.fields) { if (f.isConst) continue; lines.push("inst " + f.name + ":" + f.kind + " = " + (intish(f) ? rdV(inv, f) : "(not int)")); } } catch (e) { lines.push("error reading instance: " + (e.message || e)); } }
-  else lines.push("(instance not found / not live)");
-  if (k) for (const f of RT.klassFields(k)) { if (f.isConst || !intish(f)) continue; lines.push("static " + f.name + ":" + f.kind + " = " + rdV(0, f)); }
-  dlog("wallet debug [" + INV + "] singleton=" + (inv ? "0x" + inv.toString(16) : "MISSING") + "\n" + (lines.length ? lines.join("\n") : "(no fields found)"));
-};
-const score = (x) => (/_total/i.test(x.f.name) ? 4 : 0) + (/^_?(coins|keys)$/i.test(x.f.name) ? 2 : 0) + (x.tag === "inst" ? 1 : 0) + (x.f.kind === "int" || x.f.kind === "uint" ? 2 : x.f.kind === "long" || x.f.kind === "ulong" ? 1.5 : x.f.kind === "float" || x.f.kind === "double" ? 1.2 : 0);
-const hits = found.filter((x) => intish(x.f) && (re.test(x.f.name) || commonNames.includes(x.f.name))).sort((a, b) => score(b) - score(a));
-if (!inv) { dump(); throw new Error("InventorySave singleton missing — open the main menu first. Field dump logged (copy it with the Log tab)"); }
-if (!hits.length) { dump(); throw new Error("no integer field containing \"" + want + "\" was found on InventorySave (" + found.length + " fields). The exact field names and types are in the log (Log tab) — paste them to the fix list"); }
-const pick = hits[0], field = pick.f, obj = pick.obj;
-let before = RT.read(obj, field);
-if (field.kind === "long" || field.kind === "ulong") before = Number(before); else before = before | 0;
+const cands = [], seen = new Set();
+const addCand = (cls, f, tag, obj, v) => { const key = cls + "|" + f.name + "|" + tag + "|" + obj; if (seen.has(key)) return; seen.add(key); cands.push({ cls, f, tag, obj, v }); };
+const addFromFields = (cls, fields, tag, obj) => { if (!fields) return; for (const f of fields) { if (f.isConst || !f.name || f.isStatic !== (tag === "static")) continue; if (!intish(f) || !re.test(f.name)) continue; addCand(cls, f, tag, obj, rdV(tag === "static" ? 0 : obj, f)); } };
+// 1) InventorySave itself (instance + statics)
+const inv = RT.singleton(INV);
+if (inv) { try { const info = RT.inspect(inv); if (info) addFromFields(INV, info.fields, "inst", inv); } catch (e) {} }
+{ const k = RT.klassByName(INV); if (k) try { addFromFields(INV, RT.klassFields(k), "static", 0); } catch (e) {} }
+// 2) every class whose name looks like a money/save container
+const allNames = (RT.meta && RT.meta.byName) ? RT.meta.byName : [];
+for (const entry of allNames) {
+  const full = entry[0]; if (!CLS_HINT.test(full)) continue;
+  for (const ti of entry[1]) for (const k of (RT.klassOf.get(ti) || [])) { try { addFromFields(full, RT.klassFields(k), "static", 0); } catch (e) {} }
+  let inst = []; try { inst = RT.liveAll(full); } catch (e) {}
+  for (const o of inst.slice(0, 2)) { try { const info = RT.inspect(o); if (info) addFromFields(full, info.fields, "inst", o); } catch (e) {} }
+}
+// 3) last resort: any int-ish field anywhere whose name is exactly coins/keys
+if (!cands.length) {
+  for (const entry of allNames) {
+    const full = entry[0];
+    for (const ti of entry[1]) for (const k of (RT.klassOf.get(ti) || [])) {
+      let fields; try { fields = RT.klassFields(k); } catch (e) { continue; }
+      if (!fields) continue;
+      for (const f of fields) {
+        if (f.isConst || !f.name || !intish(f)) continue;
+        if (!/^_?total(coins|keys)$/i.test(f.name) && !/^_?(coins|keys)$/i.test(f.name)) continue;
+        if (f.isStatic) addCand(full, f, "static", 0, rdV(0, f));
+      }
+    }
+    let inst = []; try { inst = RT.liveAll(full); } catch (e) {}
+    for (const o of inst.slice(0, 1)) {
+      try { const info = RT.inspect(o); if (info) for (const f of info.fields) { if (!f.isConst && f.name && intish(f) && (/^_?total(coins|keys)$/i.test(f.name) || /^_?(coins|keys)$/i.test(f.name))) addCand(full, f, "inst", o, rdV(o, f)); } } catch (e) {}
+    }
+  }
+}
+// also look for a native AddCoins/AddKeys API to report to the user
+const nativeApis = [];
+for (const entry of allNames) {
+  const full = entry[0]; if (!CLS_HINT.test(full)) continue;
+  for (const ti of entry[1]) for (const k of (RT.klassOf.get(ti) || [])) {
+    let ms; try { ms = RT.methodsChain(k); } catch (e) { continue; }
+    for (const m of ms) { if (/^add.?(coin|key|currency|money|cash)/i.test(m.name) || /^(give|grant|earn).?(coin|key)/i.test(m.name)) { if (nativeApis.length < 6) nativeApis.push(full + "::" + m.name + "(" + m.pars.map((p) => p.type).join(",") + ")"); } }
+  }
+}
+const score = (x) => (/^_?total(coins|keys)$|^_?(coins|keys)$/i.test(x.f.name) ? 6 : 0) + (/inventory|save|wallet|currency|profile|pocket|balance|bank/i.test(x.cls) ? 4 : 0) + (x.cls === INV ? 2 : 0) + (x.tag === "inst" ? 1 : 0) + (x.f.kind === "int" || x.f.kind === "uint" ? 2 : x.f.kind === "long" || x.f.kind === "ulong" ? 1.5 : x.f.kind === "float" || x.f.kind === "double" ? 1.2 : 0) + (typeof x.v === "number" && x.v >= 0 && x.v < 2000000000 ? 1 : 0);
+cands.sort((a, b) => score(b) - score(a));
+dlog("wallet[" + want + "] candidates (" + cands.length + "):\n" + (cands.slice(0, 10).map((x) => "  " + (x.tag === "inst" ? hex(x.obj) : "static") + "  " + x.cls + "." + x.f.name + ":" + x.f.kind + " = " + x.v).join("\n") || "  (none)") + (nativeApis.length ? "\nnative coin APIs found:\n" + nativeApis.map((s) => "  " + s).join("\n") : "\n(no native AddCoins-like API found)"));
+if (!cands.length) throw new Error("no integer field containing \"" + want + "\" anywhere — full candidate dump logged (Log tab). The wallet UI in this build is likely wired through events only; writing coins directly is not possible this way");
+const pick = cands[0], field = pick.f, obj = pick.obj;
+let before = rdV(obj, field); if (before === null) before = 0;
 const next = Math.max(0, Math.min(2000000000, before + Math.round(n)));
 RT.write(obj, field, next);
-dlog("wallet[" + want + "] " + field.name + " (" + field.kind + ", " + pick.tag + ") " + before + " -> " + next);
-return before + " -> " + next + "  [" + field.name + "]";
+dlog("wallet[" + want + "] " + field.name + " (" + field.kind + ", " + pick.tag + ", " + pick.cls + ") " + before + " -> " + next);
+return before + " -> " + next + "  [" + pick.cls.slice(pick.cls.lastIndexOf(".") + 1) + "." + field.name + "]";
 }
 
 const PWR = [["jetpack", /jet/i], ["pogo", /pogo/i], ["magnet", /magnet/i], ["sneaker", /sneak/i], ["2x", /2x|multiplier|double/i]];
@@ -1598,6 +1717,7 @@ textarea.txt{height:120px;padding:8px 10px;resize:vertical;font:11.5px ${MONO};l
 .ib{flex:none;width:26px;height:24px;border:0;border-radius:8px;background:var(--btn);color:var(--btnTx);display:grid;place-items:center;cursor:pointer;padding:0}
 .ib.on{background:linear-gradient(135deg,var(--ac),var(--ac2));color:#1a1304}
 .link{color:var(--ac);cursor:pointer}.link:hover{text-decoration:underline}
+.tr.on{background:linear-gradient(90deg,rgba(232,178,61,.16),rgba(232,178,61,.05));box-shadow:inset 2px 0 0 var(--ac)}
 pre.out{margin:0;padding:8px 10px;border-radius:12px;background:rgba(0,0,0,.28);font:11px/1.45 ${MONO};white-space:pre-wrap;word-break:break-all;max-height:190px;overflow:auto;user-select:text}
 .sub{display:flex;gap:6px}.sub .btn{flex:1}.sub .btn.on{background:linear-gradient(135deg,var(--ac),var(--ac2));color:#1a1304}
 .rs{position:absolute;right:7px;bottom:7px;width:20px;height:20px;cursor:nwse-resize;touch-action:none;opacity:.8;background:linear-gradient(135deg,transparent 0 48%,var(--ac) 48% 58%,transparent 58% 68%,var(--ac) 68% 78%,transparent 78%);border-bottom-right-radius:20px}
@@ -1720,7 +1840,20 @@ btn("Sneakers", () => { try { say(ss.grant("Sneakers")); } catch (e) { say(e.mes
 btn("Headstart", () => { try { say(ss.grant("Headstart")); } catch (e) { say(e.message); } }, "")
 ]),
 el("div", { className: "row", style: "margin-top:8px" }, [lbl("Replace coins with"), injectSel]),
-el("div", { className: "btns" }, [btn("Replace all Coins", () => { pk.force = injectSel.value; setGroup("force", true); say("forcing " + pk.force + " at every spawn point"); }, "hot")])
+el("div", { className: "btns" }, [btn("Replace all Coins", () => {
+if (!RT || !RT.ok) { say("not connected yet"); return; }
+pk.force = injectSel.value;
+try {
+const mode = (RT.enumOf(P_MODE) || []).find((x) => x.name === "WillForcePickupType");
+const val = pickupTypeValue(pk.force);
+const spots = P_SPOT ? RT.find(P_SPOT).filter((o) => { try { return RT.isLive(o); } catch (e) { return false; } }) : [];
+if (spots.length) {
+const sample = spots[0];
+try { const info = RT.inspect(sample); if (info) dlog("spawn point fields: " + info.fields.map((f) => f.name + ":" + f.kind).join(", ")); } catch (e) {}
+}
+setGroup("force", true);
+say(spots.length ? "forcing " + pk.force + " — pinned " + spots.length + " live spawn point(s) (mode " + (mode ? mode.value : "?") + ", type " + val + "). New road chunks spawn " + pk.force + " instead of coins." : "no live spawn points found yet — start a run first");
+} catch (e) { say("error: " + (e.message || e)); } }, "hot")])
 ], "spawn");
 
 // ===== Destructive Mode =====
@@ -1732,12 +1865,17 @@ const DM_RE = {
   mult: /maxmultiplier|multipliercap|multiplier_cap|maxmult|multiplierlimit|max_multiplier|maxscoremultiplier/i,
   timer: /timeleft/i
 };
+// "Annihilator": any field whose name looks like a cap, EXCEPT anything that sizes an
+// allocation (writing INT_MAX there -> massive malloc -> hard crash). Allocation-style
+// names usually end in count/length/size/index or contain capacity/array/pool/buffer.
+const DM_ANY = /max|limit|cap/i;
+const DM_ANY_EXCLUDE = /capacit|alloc|array|pool|buffer|reserved|\bsize\b|\bcount\b|\blength\b|\bindex\b|\bseed\b|\bhash\b|frame|layer|stride|segment|queue/i;
 const dmIntKind = (k) => ["int", "uint", "long", "ulong"].indexOf(k) >= 0;
 let dmCache = null, dmCacheT = 0, dmCacheScan = -1;
 function dmCacheGet() {
   const now = Date.now();
   if (dmCache && now - dmCacheT < 2000 && RT && RT.lastScan === dmCacheScan) return dmCache;
-  const head = [], speed = [], mult = [], timer = [];
+  const head = [], speed = [], mult = [], timer = [], max = [];
   if (RT && RT.ok && RT.kinv) {
     for (const [k, ti] of RT.kinv) {
       let fields; try { fields = RT.klassFields(k); } catch (e) { fields = null; }
@@ -1752,12 +1890,13 @@ function dmCacheGet() {
         else if (DM_RE.speed.test(n) && (dmIntKind(f.kind) || f.kind === "float" || f.kind === "double")) dst = speed;
         else if (DM_RE.mult.test(n) && (dmIntKind(f.kind) || f.kind === "float" || f.kind === "double")) dst = mult;
         else if (timerCls && DM_RE.timer.test(n) && (f.kind === "float" || f.kind === "double")) dst = timer;
+        if (!dst && !timerCls && DM_ANY.test(n) && !DM_ANY_EXCLUDE.test(n) && (dmIntKind(f.kind) || f.kind === "float" || f.kind === "double")) dst = max;
         if (!dst) continue;
         for (const o of objs) { try { if (RT.isLive(o)) dst.push([o, f]); } catch (e) {} }
       }
     }
   }
-  dmCache = { head, speed, mult, timer };
+  dmCache = { head, speed, mult, timer, max };
   dmCacheT = now; dmCacheScan = RT ? RT.lastScan : -1;
   return dmCache;
 }
@@ -1765,26 +1904,33 @@ defGroup("dmhead", () => dmCacheGet().head.map(([o, f]) => [o, f, DM_INT]));
 defGroup("dmspeed", () => dmCacheGet().speed.map(([o, f]) => [o, f, DM_INT]));
 defGroup("dmmult", () => dmCacheGet().mult.map(([o, f]) => [o, f, DM_INT]));
 defGroup("dmtimer", () => dmCacheGet().timer.map(([o, f]) => [o, f, DM_TIMER]));
+defGroup("dmmax", () => dmCacheGet().max.map(([o, f]) => [o, f, DM_INT]), () => say("annihilator: " + ovCount("dmmax") + " cap-like field(s) pinned to 2147483647 — toggle off to restore the originals"));
 // WASM indirect-function-table NOPs (runtime-only, revertible)
 const dmHeadSwaps = [], dmTimerSwaps = [];
-function dmSwap(on, match, info, swaps) {
+function dmSwap(on, match, info, swaps, hint) {
   if (!RT || !RT.ok) return "not connected yet";
   const T = RT.table(); if (!T) return "no WASM function table on this build";
   if (!on) { let n = 0; while (swaps.length) { const s = swaps.pop(); try { T.set(s.fn, s.orig); n++; } catch (e) {} } return "restored " + n + " original method(s)"; }
-  const names = [];
+  const names = [], maybe = [];
+  let scanned = 0;
   for (const [k] of RT.kinv) {
     let ms; try { ms = RT.methodsChain(k); } catch (e) { continue; }
     for (const m of ms) {
+      scanned++;
+      const hay = (m.owner || "") + "." + m.name;
+      if (hint && hint.test && hint.test(hay) && maybe.length < 25) maybe.push(hay);
       if (!match(m)) continue;
       if (swaps.some((s) => s.fn === m.fn)) continue;
-      try { const orig = T.get(m.fn); T.set(m.fn, m.ret === "System.Void" ? function () {} : function () { return info; }); swaps.push({ fn: m.fn, orig, name: m.owner + "." + m.name }); names.push(m.owner + "." + m.name); } catch (e) {}
+      try { const sig = hookSig(m); if (!sig) continue; const orig = T.get(m.fn); if (!orig) continue; T.set(m.fn, buildTramp(sig, m.ret === "System.Void" ? function () {} : function () { return info; })); swaps.push({ fn: m.fn, orig, name: m.owner + "." + m.name }); names.push(m.owner + "." + m.name); } catch (e) {}
     }
   }
-  return names.length ? ("NOPed " + names.length + " method(s): " + names.slice(0, 6).join(", ")) : "no matching method found";
+  if (names.length) return "NOPed " + names.length + " method(s): " + names.slice(0, 6).join(", ");
+  dlog("dmSwap: scanned " + scanned + " methods, no match. Samples with related names:\n" + (maybe.join("\n") || "  (none — this build may use different identifiers)"));
+  return "no matching method found (scanned " + scanned + "). Related names logged (Log tab) — tell me which one to NOP";
 }
-const dmHeadNop = () => say(dmSwap(true, (m) => /canuseheadstart/i.test(m.name) || (/headstart/i.test(m.owner + "." + m.name) && /canuse|available|check|valid/i.test(m.name)), 1, dmHeadSwaps));
+const dmHeadNop = () => say(dmSwap(true, (m) => /canuseheadstart/i.test(m.name) || (/headstart/i.test(m.owner + "." + m.name) && /canuse|available|check|valid|count|max|limit/i.test(m.name)) || /^get_canuseheadstart/i.test(m.name) || /headstart/i.test(m.name) && m.pars.length === 0 && (m.ret === "System.Boolean" || m.ret === "System.Int32"), 1, dmHeadSwaps, /headstart/i));
 const dmHeadRestore = () => say(dmSwap(false, null, 1, dmHeadSwaps));
-const dmTimerNop = () => say(dmSwap(true, (m) => /activepowerup/i.test(m.owner) && /update|tick|decrement|shrink|reduce|expire|elapse|countdown|down/i.test(m.name), 0, dmTimerSwaps));
+const dmTimerNop = () => say(dmSwap(true, (m) => /powerup/i.test(m.owner + "." + m.name) && /update|tick|decrement|shrink|reduce|expire|elapse|countdown|decrease|down|consume/i.test(m.name), 0, dmTimerSwaps, /powerup|timeleft/i));
 const dmTimerRestore = () => say(dmSwap(false, null, 0, dmTimerSwaps));
 function dmScanHolders() {
   const out = [];
@@ -1858,6 +2004,7 @@ const dmCard = card("Destructive Mode", [
   R_(lbl("Uncap speed", "speed ceiling -> integer limit"), groupSw("dmspeed")),
   R_(lbl("Uncap score multiplier", "multiplier cap -> integer limit"), groupSw("dmmult")),
   R_(lbl("Infinite powerup timers", "timeLeft re-frozen every scan"), groupSw("dmtimer")),
+  R_(lbl("Limit annihilator", "EVERY cap-like field in live memory -> int limit (sizes/counts excluded)"), groupSw("dmmax")),
   el("div", { className: "btns" }, [btn("NOP headstart checks", dmHeadNop, "hot"), btn("Restore checks", dmHeadRestore, "")]),
   el("div", { className: "btns" }, [btn("NOP powerup decrement", dmTimerNop, "hot"), btn("Restore decrement", dmTimerRestore, "")]),
   el("div", { className: "row", style: "margin-top:8px" }, [lbl("Inject powerup", "spawn one out of thin air"), dmSel]),
@@ -1871,7 +2018,356 @@ el("div", { className: "btns" }, [btn("Save code as button", () => { const n = m
 macroBox, el("div", { className: "note", textContent: "Right-click or long-press a custom button to delete it. Try: ss.wallet('coins', 1000000) or ss.grant('Jetpack')" })
 ], "console");
 
-const pageSpawn = el("div", { className: "pg" }, [pickCard, chunkCard, tuneCard, injectCard, dmCard, macroCard]);
+// ---------- 3D chunk editor (Google-Snake-style level editor, but for the game world) ----------
+const CE_PAL = [
+["Coin", "#ffd60a", [0.45, 0.45, 0.45], /coin/i],
+["Train", "#8d99ae", [1.0, 1.0, 3.0], /train/i],
+["Train Car", "#6c757d", [1.0, 1.0, 2.4], /wagon|\bcar\b|railcar/i],
+["Jetpack", "#ff5d8f", [0.6, 1.0, 0.6], /jet/i],
+["Magnet", "#4cc9f0", [0.7, 0.7, 0.7], /magnet/i],
+["Sneakers", "#80ed99", [0.7, 0.5, 0.7], /sneak/i],
+["Pogo Stick", "#f4845f", [0.5, 1.0, 0.5], /pogo/i],
+["Mystery Box", "#b5179e", [0.8, 0.8, 0.8], /mystery/i],
+["2x Multiplier", "#ffb703", [0.7, 0.7, 0.7], /multiplier/i],
+["Barrier", "#ef233c", [1.0, 1.0, 0.4], /barrier|obstacle/i],
+["Ramp", "#fb8500", [1.0, 0.5, 1.0], /ramp/i],
+["Rail", "#5a5a5a", [0.3, 0.12, 3.0], /rail|track/i],
+["Tunnel", "#6d6875", [2.4, 2.0, 1.0], /tunnel/i],
+["Token", "#ffc8dd", [0.5, 0.5, 0.5], /token/i],
+["Letter", "#cdb4db", [0.4, 0.7, 0.2], /letter/i],
+["Gate / Arch", "#219ebc", [3.0, 2.0, 0.4], /gate|\barch\b|start/i]
+];
+const CE = { open: false, gx: 20, gy: 6, gz: 20, cells: new Uint8Array(20 * 6 * 20), tool: "place", sel: 0, grid: true, th: -0.75, ph: 0.5, dist: 30, tx: 10, ty: 1.5, tz: 10, cur: null, hover: null, undo: [], fs: false };
+let ceRoot = null, ceCv = null, ceGl = null, ceStat = null, cePalEl = null, ceStroke = null, ceDirty = true;
+function ceIdx(x, y, z) { return x + CE.gx * (y + CE.gy * z); }
+function ceAt(x, y, z) { return (x < 0 || y < 0 || z < 0 || x >= CE.gx || y >= CE.gy || z >= CE.gz) ? 0 : CE.cells[ceIdx(x, y, z)]; }
+function ceSet(x, y, z, v) { if (x < 0 || y < 0 || z < 0 || x >= CE.gx || y >= CE.gy || z >= CE.gz) return; CE.cells[ceIdx(x, y, z)] = v; CE.dirty = true; }
+function cePushUndo() { CE.undo.push(CE.cells.slice()); if (CE.undo.length > 30) CE.undo.shift(); }
+function ceUndo() { const p = CE.undo.pop(); if (p) { CE.cells = p; CE.dirty = true; if (ceStat) ceStat.textContent = "undo"; } }
+function ceClearAll() { cePushUndo(); CE.cells = new Uint8Array(CE.cells.length); CE.dirty = true; if (ceStat) ceStat.textContent = "cleared"; }
+const ceHexRgb = (h) => { const n = parseInt(h.slice(1), 16); return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255]; };
+const ceV3nrm = (v) => { const l = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0] / l, v[1] / l, v[2] / l]; };
+const ceV3cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const ceV3dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const ceM4mul = (a, b) => { const o = new Float32Array(16); for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) { let s = 0; for (let k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k]; o[c * 4 + r] = s; } return o; };
+const ceM4persp = (fovy, asp, n, f) => { const t = 1 / Math.tan(fovy / 2), o = new Float32Array(16); o[0] = t / asp; o[5] = t; o[10] = (f + n) / (n - f); o[11] = -1; o[14] = 2 * f * n / (n - f); return o; };
+const ceM4look = (e, c, u) => { const z = ceV3nrm([e[0] - c[0], e[1] - c[1], e[2] - c[2]]), x = ceV3nrm(ceV3cross(z, u)), y = ceV3cross(x, z); const o = new Float32Array(16); o[0] = x[0]; o[1] = y[0]; o[2] = z[0]; o[4] = x[1]; o[5] = y[1]; o[6] = z[1]; o[8] = x[2]; o[9] = y[2]; o[10] = z[2]; o[12] = -ceV3dot(x, e); o[13] = -ceV3dot(y, e); o[14] = -ceV3dot(z, e); o[15] = 1; return o; };
+const ceEye = () => { const cp = Math.cos(CE.ph), sp = Math.sin(CE.ph); return [CE.tx + CE.dist * cp * Math.sin(CE.th), CE.ty + CE.dist * sp, CE.tz + CE.dist * cp * Math.cos(CE.th)]; };
+function ceBuildMesh() {
+const P = [], C = [], LI = [];
+const gx = CE.gx, gy = CE.gy, gz = CE.gz;
+const shade = (nx, ny, nz) => ny > 0 ? 1.0 : ny < 0 ? 0.45 : (Math.abs(nx) > 0 ? 0.75 : 0.6);
+const FACES = [
+[[0, 1, 0], [[-0.5, 0.5, -0.5], [-0.5, 0.5, 0.5], [0.5, 0.5, 0.5], [0.5, 0.5, -0.5]]],
+[[0, -1, 0], [[-0.5, -0.5, -0.5], [0.5, -0.5, -0.5], [0.5, -0.5, 0.5], [-0.5, -0.5, 0.5]]],
+[[1, 0, 0], [[0.5, -0.5, -0.5], [0.5, 0.5, -0.5], [0.5, 0.5, 0.5], [0.5, -0.5, 0.5]]],
+[[-1, 0, 0], [[-0.5, -0.5, 0.5], [-0.5, 0.5, 0.5], [-0.5, 0.5, -0.5], [-0.5, -0.5, -0.5]]],
+[[0, 0, 1], [[-0.5, -0.5, 0.5], [0.5, -0.5, 0.5], [0.5, 0.5, 0.5], [-0.5, 0.5, 0.5]]],
+[[0, 0, -1], [[0.5, -0.5, -0.5], [-0.5, -0.5, -0.5], [-0.5, 0.5, -0.5], [0.5, 0.5, -0.5]]]
+];
+for (let z = 0; z < gz; z++) for (let y = 0; y < gy; y++) for (let x = 0; x < gx; x++) {
+const idx = CE.cells[ceIdx(x, y, z)]; if (!idx) continue;
+const pal = CE_PAL[idx - 1]; if (!pal) continue;
+const w = pal[2][0], h = pal[2][1], d = pal[2][2], rgb = ceHexRgb(pal[1]);
+for (const fc of FACES) {
+const n = fc[0];
+if (n[1] > 0 && ceAt(x, y + 1, z)) continue; if (n[1] < 0 && ceAt(x, y - 1, z)) continue;
+if (n[0] > 0 && ceAt(x + 1, y, z)) continue; if (n[0] < 0 && ceAt(x - 1, y, z)) continue;
+if (n[2] > 0 && ceAt(x, y, z + 1)) continue; if (n[2] < 0 && ceAt(x, y, z - 1)) continue;
+const s = shade(n[0], n[1], n[2]), cx = x + 0.5, cy = y + 0.5, cz = z + 0.5;
+const pts = fc[1].map((c) => [cx + c[0] * w, cy + c[1] * h, cz + c[2] * d]);
+const order = [0, 1, 2, 0, 2, 3];
+for (const oi of order) { const p = pts[oi]; P.push(p[0], p[1], p[2]); C.push(rgb[0] * s, rgb[1] * s, rgb[2] * s); }
+}
+}
+if (CE.grid) { for (let i = 0; i <= gx; i++) LI.push(i, 0.001, 0, i, 0.001, gz); for (let i = 0; i <= gz; i++) LI.push(0, 0.001, i, gx, 0.001, i); }
+if (CE.cur) { const c = CE.cur; if (c[0] >= 0 && c[0] < gx && c[1] >= 0 && c[1] < gy && c[2] >= 0 && c[2] < gz) { const x = c[0] + 0.5, y = c[1] + 0.5, z = c[2] + 0.5, s = 0.56; const E = [[-s,-s,-s],[s,-s,-s],[s,s,-s],[-s,s,-s],[-s,-s,s],[s,-s,s],[s,s,s],[-s,s,s]]; const ED = [[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]]; for (const ed of ED) LI.push(x + E[ed[0]][0], y + E[ed[0]][1], z + E[ed[0]][2], x + E[ed[1]][0], y + E[ed[1]][1], z + E[ed[1]][2]); } }
+return { P: new Float32Array(P), C: new Float32Array(C), LI: new Float32Array(LI) };
+}
+function ceShaderInit(gl) {
+if (!gl) return null;
+const vs = "attribute vec3 p;attribute vec3 c;uniform mat4 vp;varying vec3 v;void main(){v=c;gl_Position=vp*vec4(p,1.0);}";
+const fs = "precision mediump float;varying vec3 v;uniform float line;uniform vec3 lineC;void main(){gl_FragColor = line > 0.5 ? vec4(lineC,1.0) : vec4(v,1.0);}";
+const comp = (t, s) => { const sh = gl.createShader(t); gl.shaderSource(sh, s); gl.compileShader(sh); return sh; };
+const prog = gl.createProgram(); gl.attachShader(prog, comp(gl.VERTEX_SHADER, vs)); gl.attachShader(prog, comp(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(prog); gl.useProgram(prog);
+const aP = gl.getAttribLocation(prog, "p"), aC = gl.getAttribLocation(prog, "c");
+return { prog, aP, aC, uVP: gl.getUniformLocation(prog, "vp"), uLine: gl.getUniformLocation(prog, "line"), uLineC: gl.getUniformLocation(prog, "lineC") };
+}
+function ceDraw() {
+const gl = ceGl; if (!gl || !CE.open || !ceCv) return;
+const dpr = Math.min(2, window.devicePixelRatio || 1);
+const W = Math.max(2, Math.floor(ceCv.clientWidth * dpr)), H = Math.max(2, Math.floor(ceCv.clientHeight * dpr));
+if (ceCv.width !== W || ceCv.height !== H) { ceCv.width = W; ceCv.height = H; }
+gl.viewport(0, 0, W, H);
+gl.clearColor(0.086, 0.067, 0.024, 1);
+gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+gl.enable(gl.DEPTH_TEST);
+const eye = ceEye();
+const vp = ceM4mul(ceM4persp(Math.PI / 4, W / H, 0.1, 200), ceM4look(eye, [CE.tx, CE.ty, CE.tz], [0, 1, 0]));
+const mesh = ceBuildMesh(), dr = CE._sh; if (!dr) return;
+gl.useProgram(dr.prog);
+gl.uniformMatrix4fv(dr.uVP, false, vp);
+gl.enableVertexAttribArray(dr.aP); gl.enableVertexAttribArray(dr.aC);
+const bp = gl.createBuffer(), bc = gl.createBuffer();
+if (mesh.P.length) {
+gl.bindBuffer(gl.ARRAY_BUFFER, bp); gl.bufferData(gl.ARRAY_BUFFER, mesh.P, gl.DYNAMIC_DRAW);
+gl.vertexAttribPointer(dr.aP, 3, gl.FLOAT, false, 0, 0);
+gl.bindBuffer(gl.ARRAY_BUFFER, bc); gl.bufferData(gl.ARRAY_BUFFER, mesh.C, gl.DYNAMIC_DRAW);
+gl.vertexAttribPointer(dr.aC, 3, gl.FLOAT, false, 0, 0);
+gl.uniform1f(dr.uLine, 0);
+gl.drawArrays(gl.TRIANGLES, 0, mesh.P.length / 3);
+}
+if (mesh.LI.length) {
+gl.bindBuffer(gl.ARRAY_BUFFER, bp); gl.bufferData(gl.ARRAY_BUFFER, mesh.LI, gl.DYNAMIC_DRAW);
+gl.vertexAttribPointer(dr.aP, 3, gl.FLOAT, false, 0, 0);
+gl.vertexAttribPointer(dr.aC, 3, gl.FLOAT, false, 0, 0);
+gl.uniform1f(dr.uLine, 1); gl.uniform3f(dr.uLineC, 1.0, 0.84, 0.3);
+gl.drawArrays(gl.LINES, 0, mesh.LI.length / 3);
+}
+gl.disableVertexAttribArray(dr.aP); gl.disableVertexAttribArray(dr.aC);
+gl.deleteBuffer(bp); gl.deleteBuffer(bc);
+}
+function ceRayFrom(clientX, clientY) {
+const r = ceCv.getBoundingClientRect();
+const nx = ((clientX - r.left) / r.width) * 2 - 1, ny = -(((clientY - r.top) / r.height) * 2 - 1);
+const eye = ceEye(), fwd = ceV3nrm([CE.tx - eye[0], CE.ty - eye[1], CE.tz - eye[2]]);
+const right = ceV3nrm(ceV3cross(fwd, [0, 1, 0])), upv = ceV3cross(right, fwd);
+const tan = Math.tan(Math.PI / 8), aspect = r.width / Math.max(1, r.height);
+const dir = ceV3nrm([fwd[0] + right[0] * nx * tan * aspect + upv[0] * ny * tan, fwd[1] + right[1] * nx * tan * aspect + upv[1] * ny * tan, fwd[2] + right[2] * nx * tan * aspect + upv[2] * ny * tan]);
+const ex = eye[0], ey = eye[1], ez = eye[2];
+let ix = Math.floor(ex), iy = Math.floor(ey), iz = Math.floor(ez);
+const sx = dir[0] >= 0 ? 1 : -1, sy = dir[1] >= 0 ? 1 : -1, sz = dir[2] >= 0 ? 1 : -1;
+const tX = Math.abs(1 / (dir[0] || 1e-9)), tY = Math.abs(1 / (dir[1] || 1e-9)), tZ = Math.abs(1 / (dir[2] || 1e-9));
+let mX = (sx > 0 ? (ix + 1 - ex) : (ex - ix)) * tX, mY = (sy > 0 ? (iy + 1 - ey) : (ey - iy)) * tY, mZ = (sz > 0 ? (iz + 1 - ez) : (ez - iz)) * tZ;
+let la = -1, ls = 0, t = 0;
+for (let i = 0; i < 160; i++) {
+if (ix >= 0 && iy >= 0 && iz >= 0 && ix < CE.gx && iy < CE.gy && iz < CE.gz && CE.cells[ceIdx(ix, iy, iz)]) { const n = [0, 0, 0]; if (la >= 0) n[la] = -ls; else n[1] = 1; return { cell: [ix, iy, iz], n }; }
+if (mX < mY && mX < mZ) { mX += tX; ix += sx; la = 0; ls = sx; } else if (mY < mZ) { mY += tY; iy += sy; la = 1; ls = sy; } else { mZ += tZ; iz += sz; la = 2; ls = sz; }
+t += Math.min(mX, mY, mZ); if (t > 100) break;
+if (ix < -1 || iy < -1 || iz < -1 || ix > CE.gx || iy > CE.gy || iz > CE.gz) break;
+}
+return null;
+}
+function ceRayFloor(clientX, clientY) {
+const r = ceCv.getBoundingClientRect();
+const nx = ((clientX - r.left) / r.width) * 2 - 1, ny = -(((clientY - r.top) / r.height) * 2 - 1);
+const eye = ceEye(), fwd = ceV3nrm([CE.tx - eye[0], CE.ty - eye[1], CE.tz - eye[2]]);
+const right = ceV3nrm(ceV3cross(fwd, [0, 1, 0])), upv = ceV3cross(right, fwd);
+const tan = Math.tan(Math.PI / 8), aspect = r.width / Math.max(1, r.height);
+const dir = ceV3nrm([fwd[0] + right[0] * nx * tan * aspect + upv[0] * ny * tan, fwd[1] + right[1] * nx * tan * aspect + upv[1] * ny * tan, fwd[2] + right[2] * nx * tan * aspect + upv[2] * ny * tan]);
+if (Math.abs(dir[1]) < 1e-6) return null;
+const t = -eye[1] / dir[1]; if (t < 0) return null;
+const cx = Math.floor(eye[0] + dir[0] * t), cz = Math.floor(eye[2] + dir[2] * t);
+if (cx < 0 || cz < 0 || cx >= CE.gx || cz >= CE.gz) return null;
+return [cx, 0, cz];
+}
+function ceLine(a, b) { const d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]]; const n = Math.max(Math.abs(d[0]), Math.abs(d[1]), Math.abs(d[2]), 1); const out = []; for (let i = 0; i <= n; i++) out.push([Math.round(a[0] + d[0] * i / n), Math.round(a[1] + d[1] * i / n), Math.round(a[2] + d[2] * i / n)]); return out; }
+function ceFillRect(a, b) { const out = []; const y = a[1]; const x0 = Math.min(a[0], b[0]), x1 = Math.max(a[0], b[0]), z0 = Math.min(a[2], b[2]), z1 = Math.max(a[2], b[2]); for (let x = x0; x <= x1; x++) for (let z = z0; z <= z1; z++) out.push([x, y, z]); return out; }
+function ceApplyAt(cx, cy, tool) {
+tool = tool || CE.tool;
+const face = ceRayFrom(cx, cy);
+CE.hover = face;
+if (tool === "erase") { CE.cur = face ? face.cell : null; cePaintCell(CE.cur, tool); return; }
+if (face) { const t = [face.cell[0] + face.n[0], face.cell[1] + face.n[1], face.cell[2] + face.n[2]]; CE.cur = t; cePaintCell(t, tool); return; }
+const fl = ceRayFloor(cx, cy); if (fl) { CE.cur = fl; cePaintCell(fl, tool); } else CE.cur = null;
+}
+function cePaintCell(cell, tool) {
+if (!cell) return;
+const v = tool === "erase" ? 0 : CE.sel + 1;
+ceSet(cell[0], cell[1], cell[2], v);
+}
+function ceCommitStroke() {
+if (!ceStroke) return;
+if (ceStroke.tool === "fill" && ceStroke.a && ceStroke.b) for (const c of ceFillRect(ceStroke.a, ceStroke.b)) ceSet(c[0], c[1], c[2], CE.sel + 1);
+if (ceStroke.tool === "line" && ceStroke.a && ceStroke.b) for (const c of ceLine(ceStroke.a, ceStroke.b)) ceSet(c[0], c[1], c[2], CE.sel + 1);
+ceStroke = null;
+}
+function ceTemplate(re) {
+try { for (const e of RT.meta.byName) { if (!re.test(e[0])) continue; for (const ti of e[1]) for (const o of (RT.objs.get(ti) || [])) { try { if (RT.isLive(o) && isUnityObj(o)) return o; } catch (x) {} } } } catch (e) {}
+return 0;
+}
+function ceApplyInGame() {
+if (!RT || !RT.ok) { say("not connected yet"); return; }
+const player = findPlayerPtr(); if (!player) { say("start a run first — the editor needs the player"); return; }
+const p = objPos(player); if (!p) { say("could not read the player position"); return; }
+const yaw = objEulerY(player) || 0, rr = yaw * Math.PI / 180;
+const fwd = [Math.sin(rr), 0, Math.cos(rr)], right = [Math.cos(rr), 0, -Math.sin(rr)];
+const cs = 2.0, cx = (CE.gx - 1) / 2, cz = (CE.gz - 1) / 2;
+const tpl = {}; let n = 0; const missed = [];
+for (let y = 0; y < CE.gy; y++) for (let z = 0; z < CE.gz; z++) for (let x = 0; x < CE.gx; x++) {
+const idx = CE.cells[ceIdx(x, y, z)]; if (!idx) continue;
+const pal = CE_PAL[idx - 1];
+if (!(pal.name in tpl)) tpl[pal.name] = ceTemplate(pal[3]);
+const t = tpl[pal.name]; if (!t) { if (missed.indexOf(pal.name) < 0) missed.push(pal.name); continue; }
+const wx = p[0] + right[0] * (x - cx) * cs + fwd[0] * (z - cz) * cs, wz = p[2] + right[2] * (x - cx) * cs + fwd[2] * (z - cz) * cs, wy = p[1] + 1 + y * cs;
+let cl = 0; try { cl = unityInstantiate(t) >>> 0; } catch (e) { cl = 0; }
+if (cl && objSetPos(cl, wx, wy, wz)) n++;
+}
+say(n ? "spawned " + n + " object(s) in front of you" + (missed.length ? " — no live asset found for: " + missed.join(", ") : "") : "nothing spawned — no live assets matching those placements are loaded right now");
+}
+function ceSave() { try { const arr = Array.from(CE.cells); lsSet("ssCeCells", JSON.stringify(arr)); say("layout saved (" + arr.filter((v) => v).length + " blocks)"); } catch (e) { say("save failed: " + (e.message || e)); } }
+function ceLoad() { try { const raw = lsGet("ssCeCells"); if (!raw) { say("no saved layout"); return; } const arr = JSON.parse(raw); if (arr.length !== CE.cells.length) { say("saved layout has a different grid size"); return; } cePushUndo(); CE.cells = Uint8Array.from(arr); CE.dirty = true; say("layout loaded (" + arr.filter((v) => v).length + " blocks)"); } catch (e) { say("load failed: " + (e.message || e)); } }
+// ---------- chunk editor UI (fullscreen overlay, styled like the mod menu) ----------
+const CE_TOOLS = [["place", "Brush", "B"], ["erase", "Eraser", "E"], ["fill", "Fill", "F"], ["line", "Line", "L"]];
+function ceToggleFullscreen() {
+try {
+if (document.fullscreenElement) { document.exitFullscreen(); return; }
+if (FR && FR.requestFullscreen) { FR.setAttribute("allowfullscreen", "true"); const p = FR.requestFullscreen(); if (p && p.catch) p.catch(() => {}); return; }
+if (ceRoot && ceRoot.requestFullscreen) { const p = ceRoot.requestFullscreen(); if (p && p.catch) p.catch(() => {}); }
+} catch (e) { say("fullscreen blocked by the browser"); }
+}
+function ceBuildUI() {
+if (ceRoot) return;
+ceRoot = el("div");
+ceRoot.style.cssText = "position:absolute;inset:0;z-index:40;display:none;flex-direction:column;background:rgba(14,11,5,.985);color:#f7efdc;font-family:system-ui,sans-serif;";
+const hdr = el("div"); hdr.style.cssText = "display:flex;align-items:center;gap:8px;padding:6px 10px;border-bottom:1px solid rgba(255,214,10,.25);background:linear-gradient(180deg,rgba(255,214,10,.12),rgba(255,214,10,.02));";
+const logo = icon("cube", 16); if (logo) logo.style.cssText = "color:#ffd60a;display:inline-flex";
+const ttl = el("span", { textContent: "Chunk Editor" }); ttl.style.cssText = "font:700 13px/1 'Segoe UI',system-ui,sans-serif;color:#f5dfb2;letter-spacing:.06em;text-transform:uppercase";
+const mod = el("span", { textContent: "Current mod: Chunk Editor" }); mod.style.cssText = "font:11px/1 monospace;color:#ffd60a;opacity:.9;margin-left:6px";
+const sp = el("div"); sp.style.cssText = "flex:1";
+hdr.appendChild(logo); hdr.appendChild(ttl); hdr.appendChild(mod); hdr.appendChild(sp);
+hdr.appendChild(ibtn("scan", ceToggleFullscreen, "fullscreen (so the keybinds don't go into the game)"));
+hdr.appendChild(ibtn("back", ceClose, "close editor (Esc)"));
+const body = el("div"); body.style.cssText = "flex:1;display:flex;min-height:0;";
+const vp = el("div"); vp.style.cssText = "position:relative;flex:1;min-width:0;overflow:hidden;";
+ceCv = el("canvas"); ceCv.style.cssText = "position:absolute;inset:0;width:100%;height:100%;display:block;touch-action:none;";
+ceStat = el("div"); ceStat.style.cssText = "position:absolute;left:8px;bottom:8px;font:11px/1.4 monospace;color:#ffd60a;background:rgba(0,0,0,.55);padding:3px 8px;border-radius:6px;pointer-events:none;";
+ceStat.textContent = "place";
+vp.appendChild(ceCv); vp.appendChild(ceStat);
+const panel = el("div"); panel.style.cssText = "width:172px;flex:none;border-left:1px solid rgba(255,214,10,.25);background:rgba(24,19,8,.6);display:flex;flex-direction:column;overflow:hidden;";
+const pHead = el("div", { textContent: "ASSETS" }); pHead.style.cssText = "padding:6px 8px 4px;font:700 10px monospace;letter-spacing:.15em;color:#ffd60a;";
+cePalEl = el("div"); cePalEl.style.cssText = "flex:1;overflow-y:auto;padding:2px 4px 4px;";
+CE_PAL.forEach((pal, i) => {
+const r = el("div"); r.style.cssText = "display:flex;align-items:center;gap:6px;padding:4px 6px;border-radius:6px;cursor:pointer;border:1px solid transparent;";
+r.title = "click to select (key " + String((i + 1) % 10) + ")";
+const chip = el("div"); chip.style.cssText = "width:14px;height:14px;flex:none;border-radius:4px;background:" + pal[1] + ";border:1px solid rgba(255,255,255,.35);";
+const nm = el("span", { textContent: pal[0] }); nm.style.cssText = "font:11px monospace;color:#f7efdc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
+r.appendChild(chip); r.appendChild(nm);
+r.onclick = () => { CE.sel = i; ceRenderSel(); };
+cePalEl.appendChild(r); r.__i = i;
+});
+const toolHead = el("div", { textContent: "TOOLS" }); toolHead.style.cssText = "padding:6px 8px 4px;font:700 10px monospace;letter-spacing:.15em;color:#ffd60a;border-top:1px solid rgba(255,214,10,.15);";
+const toolEl = el("div"); toolEl.style.cssText = "display:flex;gap:4px;padding:2px 6px 8px;flex-wrap:wrap;";
+cePalEl.__tools = {};
+CE_TOOLS.forEach(([id, label, key]) => {
+const b = el("button", { textContent: label + " (" + key + ")" }); b.style.cssText = "font:10px monospace;padding:4px 8px;border-radius:6px;border:1px solid rgba(255,214,10,.4);background:transparent;color:#f5dfb2;cursor:pointer;";
+b.onclick = () => { CE.tool = id; ceRenderSel(); };
+cePalEl.__tools[id] = b; toolEl.appendChild(b);
+});
+panel.appendChild(pHead); panel.appendChild(cePalEl); panel.appendChild(toolHead); panel.appendChild(toolEl);
+body.appendChild(vp); body.appendChild(panel);
+const bbar = el("div"); bbar.style.cssText = "display:flex;align-items:center;gap:6px;padding:6px 10px;border-top:1px solid rgba(255,214,10,.25);background:linear-gradient(0deg,rgba(255,214,10,.1),rgba(255,214,10,.02));";
+bbar.appendChild(btn("Apply in game", ceApplyInGame, "hot", "play"));
+bbar.appendChild(btn("Undo", ceUndo, "", "undo"));
+bbar.appendChild(btn("Clear", () => { ceClearAll(); }, "", "trash"));
+bbar.appendChild(btn("Save", ceSave, "", "save"));
+bbar.appendChild(btn("Load", () => { ceLoad(); }, "", "save"));
+const grl = el("span", { textContent: "Grid" }); grl.style.cssText = "font:11px monospace;color:#f5dfb2;margin-left:6px";
+bbar.appendChild(grl); bbar.appendChild(sw(() => CE.grid, (v) => { CE.grid = v; CE.dirty = true; }));
+const hint = el("span", { textContent: "LMB place · RMB erase · wheel zoom · arrows / Shift-drag orbit · 1-9 asset · B/E/F/L tools · Ctrl+Z undo · Del clear · Enter apply · Esc close" });
+hint.style.cssText = "flex:1;text-align:right;font:10px monospace;color:rgba(247,239,220,.55);";
+bbar.appendChild(hint);
+ceRoot.appendChild(hdr); ceRoot.appendChild(body); ceRoot.appendChild(bbar);
+D.body.appendChild(ceRoot);
+try { ceGl = ceCv.getContext("webgl", { antialias: false, depth: true }) || ceCv.getContext("experimental-webgl"); } catch (e) { ceGl = null; }
+CE._sh = ceShaderInit(ceGl);
+let paintBtn = -1, paintTool = "place", orbit = false, lastX = 0, lastY = 0;
+ceCv.addEventListener("pointerdown", (e) => {
+ceCv.setPointerCapture && ceCv.setPointerCapture(e.pointerId);
+lastX = e.clientX; lastY = e.clientY;
+if (e.button === 1 || (e.button === 0 && e.shiftKey)) { orbit = true; return; }
+if (e.button !== 0 && e.button !== 2) return;
+const tool = e.button === 2 ? "erase" : CE.tool;
+if (tool === "fill" || tool === "line") {
+const face = ceRayFrom(e.clientX, e.clientY); const fl = face ? face.cell : ceRayFloor(e.clientX, e.clientY);
+if (!fl) return;
+ceStroke = { tool, a: fl.slice(), b: fl.slice() };
+cePushUndo(); ceStat.textContent = tool + ": " + fl.join(",");
+return;
+}
+paintBtn = e.button; paintTool = tool; cePushUndo(); ceApplyAt(e.clientX, e.clientY, tool);
+});
+ceCv.addEventListener("pointermove", (e) => {
+const dx = e.clientX - lastX, dy = e.clientY - lastY; lastX = e.clientX; lastY = e.clientY;
+if (orbit) { CE.th -= dx * 0.008; CE.ph = Math.max(0.12, Math.min(1.45, CE.ph + dy * 0.008)); ceDirty = true; return; }
+if (ceStroke) {
+const face = ceRayFrom(e.clientX, e.clientY); const fl = face ? face.cell : ceRayFloor(e.clientX, e.clientY);
+if (fl) { ceStroke.b = fl.slice(); CE.cur = fl; CE.dirty = true; ceStat.textContent = ceStroke.tool + " -> " + fl.join(","); }
+return;
+}
+const face = ceRayFrom(e.clientX, e.clientY); CE.hover = face;
+if (CE.tool === "erase") CE.cur = face ? face.cell : null;
+else if (face) CE.cur = [face.cell[0] + face.n[0], face.cell[1] + face.n[1], face.cell[2] + face.n[2]];
+else { const fl = ceRayFloor(e.clientX, e.clientY); CE.cur = fl; }
+if (paintBtn >= 0) ceApplyAt(e.clientX, e.clientY, paintTool);
+ceDirty = true;
+});
+const endStroke = () => { paintBtn = -1; orbit = false; ceCommitStroke(); };
+ceCv.addEventListener("pointerup", endStroke);
+ceCv.addEventListener("pointercancel", endStroke);
+ceCv.addEventListener("pointerleave", () => { CE.hover = null; CE.cur = null; ceDirty = true; });
+ceCv.addEventListener("contextmenu", (e) => { e.preventDefault(); });
+ceCv.addEventListener("wheel", (e) => { e.preventDefault(); CE.dist = Math.max(8, Math.min(90, CE.dist * (1 + (e.deltaY > 0 ? 0.12 : -0.107)))); ceDirty = true; }, { passive: false });
+D.addEventListener("keydown", ceKey);
+ceRoot.tabIndex = 0;
+}
+function ceRenderSel() {
+Array.from(cePalEl.children).forEach((c) => { const on = c.__i === CE.sel; c.style.background = on ? "rgba(255,214,10,.18)" : "transparent"; c.style.borderColor = on ? "#ffd60a" : "transparent"; });
+for (const id in cePalEl.__tools) { const b = cePalEl.__tools[id]; const on = CE.tool === id; b.style.background = on ? "rgba(255,214,10,.25)" : "transparent"; }
+if (ceStat) ceStat.textContent = CE.tool + "  ·  " + CE_PAL[CE.sel][0];
+}
+function ceKey(e) {
+if (!CE.open) return;
+const tag = e.target && e.target.tagName;
+if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+const k = e.key, low = k.toLowerCase();
+if (e.ctrlKey && low === "z") { ceUndo(); e.preventDefault(); return; }
+if (k === "Escape") { ceClose(); e.preventDefault(); return; }
+if (k === "Enter") { ceApplyInGame(); e.preventDefault(); return; }
+if (k === "Delete" || k === "Backspace") { ceClearAll(); e.preventDefault(); return; }
+if (k === "ArrowLeft") { CE.th += 0.12; ceDirty = true; e.preventDefault(); return; }
+if (k === "ArrowRight") { CE.th -= 0.12; ceDirty = true; e.preventDefault(); return; }
+if (k === "ArrowUp") { CE.ph = Math.min(1.45, CE.ph + 0.1); ceDirty = true; e.preventDefault(); return; }
+if (k === "ArrowDown") { CE.ph = Math.max(0.12, CE.ph - 0.1); ceDirty = true; e.preventDefault(); return; }
+if (k === "+" || k === "=") { CE.dist = Math.max(8, CE.dist * 0.85); ceDirty = true; return; }
+if (k === "-") { CE.dist = Math.min(90, CE.dist * 1.18); ceDirty = true; return; }
+if (low === "b") CE.tool = "place"; else if (low === "e") CE.tool = "erase"; else if (low === "f") CE.tool = "fill"; else if (low === "l") CE.tool = "line"; else if (low === "g") { CE.grid = !CE.grid; CE.dirty = true; }
+else if (/^[0-9]$/.test(k)) { const i = k === "0" ? 9 : (+k - 1); if (i < CE_PAL.length) CE.sel = i; }
+else return;
+ceRenderSel(); e.preventDefault();
+}
+function ceOpen() {
+ceBuildUI();
+CE.open = true; CE.dirty = true;
+ceRoot.style.display = "flex";
+ceRenderSel();
+try { FR.setAttribute("allowfullscreen", "true"); const p = FR.requestFullscreen ? FR.requestFullscreen() : null; if (p && p.catch) p.catch(() => {}); } catch (e) {}
+try { ceRoot.focus(); } catch (e) {}
+}
+function ceClose() {
+CE.open = false; if (!ceRoot) return; ceRoot.style.display = "none";
+try { if (document.fullscreenElement) document.exitFullscreen(); } catch (e) {}
+}
+const ceCard = card("Chunk Editor", [
+el("div", { className: "note", textContent: "A fullscreen 3D level editor, like the legendary Google Snake level editor. Paint trains, coins, powerups, ramps, rails, tunnels, tokens and anything else that is loaded in the game into the world, then spawn the whole layout in front of you with one click. Opens fullscreen so the keybinds never leak into the game." }),
+R_(lbl("Open the editor", "Esc closes · Enter applies · fullscreen keeps keys away from the game"), el("div", { className: "btns" }, [btn("Chunk Editor", ceOpen, "hot", "cube")]))
+], "cube");
+// render loop (only redraws when something changed)
+let ceRaf = 0;
+function ceLoop() {
+if (CE.open && ceDirty) { ceDirty = false; ceDraw(); }
+ceRaf = requestAnimationFrame(ceLoop);
+}
+ceLoop();
+
+const dcCard = card("Double Coins FX", [
+el("div", { className: "note", textContent: "Clones every coin on the track and shifts each copy one lane to the side, so a real 2x / Double Coins mystery powerup literally shows twice as many coins around you. Clones are tracked, so auto mode never doubles the doubles." }),
+R_(lbl("Auto-duplicate while 2x / Double Coins is active", "checks once a second while the powerup runs"), sw(() => coinFx.auto, (v) => { coinFx.auto = v; say(v ? "auto double-coins on" : "auto double-coins off"); })),
+R_(lbl("Lane shift", "how far sideways each copy lands"), num(() => coinFx.side, (v) => { coinFx.side = Math.max(0.5, Math.min(6, v)); }, true)),
+el("div", { className: "btns" }, [btn("Duplicate all coins now", () => { try { doubleCoinsOnce(false); } catch (e) { say(String(e.message || e)); } }, "hot", "plus"), btn("Remove my duplicates", clearCoinClones, "", "undo")])
+], "plus");
+
+const pageSpawn = el("div", { className: "pg" }, [pickCard, dcCard, chunkCard, tuneCard, injectCard, dmCard, ceCard, macroCard]);
 
 // ===== SCAN =====
 function ssScanEl() {
@@ -2111,39 +2607,53 @@ clsSearch.addEventListener("input", () => { clearTimeout(clsSearch.__t); clsSear
 const exClsCard = card("Classes", [clsSearch, clsList], "cube");
 const exSrcCard = card("C# preview (view only)", [srcHead, srcOut, el("div", { className: "btns" }, [btn("Copy", () => copyText(srcOut.textContent), "", "copy"), btn("Live objects", () => { const ti = srcState.ti; if (ti === null) return; ex.cls = ti; ex.objs = (RT.objs.get(ti) || []).slice(0, 60); ex.obj = null; ex.stack = []; setSub("objects"); exRender(); }, "", "list")])], "console");
 // ===== Live Edit (WASM hot-patching) =====
-const leState = { ti: null, methodList: [], sel: null, orig: null, origSig: "" };
-const leSearch = el("input", { type: "text", className: "txt", placeholder: "search methods (e.g. get_position, Update, FixedUpdate)...", spellcheck: false });
+const leState = { ti: null, methodList: [], sel: null, swaps: new Map() };
+const leSearch = el("input", { type: "text", className: "txt", placeholder: "search methods (e.g. Update, FixedUpdate, get_position)...", spellcheck: false });
 const leList = el("div", { className: "tbl" });
 const leHead = el("div", { className: "note", textContent: "select a class in Classes, then click a method below" });
-const leOut = el("textarea", { className: "txt", spellcheck: false, placeholder: "// JavaScript to replace the method. Signature: (thisPtr, ...args) or (...args) for static.\n// Example: return 30; // force speed to 30\n// Example: return; // no-op (void methods)" });
+const leOut = el("textarea", { className: "txt", spellcheck: false, placeholder: "// Write JavaScript — it REPLACES the method.\n//  thisPtr = the object pointer (0 for static)\n//  args    = array with the method parameters\n//  original() = call the original method with the same arguments\n// Examples:\n//   return 30;                    // force FixedUpdate-speed style values\n//   return original();            // call through unchanged\n//   if (args.length) args[0] = 9999; return original();  // change an argument" });
 leOut.style.cssText = "min-height:120px;font:11px/1.4 " + MONO + ";width:100%;box-sizing:border-box;background:#160d04;color:#f5dfb2;border:1px solid #4a2c14;border-radius:6px;padding:6px 8px;";
-leOut.readOnly = false; leOut.disabled = false; try { leOut.removeAttribute("readonly"); leOut.removeAttribute("disabled"); leOut.removeAttribute("disabled"); } catch (e) {}
+leOut.readOnly = false; leOut.disabled = false; try { leOut.removeAttribute("readonly"); leOut.removeAttribute("disabled"); } catch (e) {}
 const leErr = el("pre", { className: "out", textContent: "" });
 leErr.style.cssText = "display:none;font:11px/1.3 " + MONO + ";color:#ff6b6b;background:#2a0a0a;border:1px solid #5a1a1a;border-radius:6px;padding:6px 8px;margin-top:4px;white-space:pre-wrap;max-height:100px;overflow:auto;";
+const shortType = (t) => String(t || "?").replace("System.", "");
+const friendlyErr = (e) => {
+const raw = String((e && e.message) || e || "unknown error");
+if (/unexpected token|unexpected end of input|invalid or unexpected/i.test(raw)) return "syntax error in your code: " + raw;
+if (/function-typed object must be null|Wasm function object/i.test(raw)) return "this build exposes the table, but the entry for this method is empty or the signature doesn't match — pick another method (or Revert everything and try again)";
+if (/dynCall|table/i.test(raw)) return "this build does not expose the wasm function table for this method";
+return raw;
+};
 function leRender() {
 leList.innerHTML = "";
 leHead.textContent = "select a class in Classes, then click a method below";
 leOut.value = ""; leErr.style.display = "none"; leErr.textContent = ""; leState.ti = null; leState.methodList = []; leState.sel = null;
 }
+function leSelClear() { leState.sel = null; Array.from(leList.children).forEach((c) => c.classList.remove("on")); }
 function leShowMethods(ti) {
 if (!RT || !RT.ok || ti === null || ti === undefined) return;
 const full = RT.meta.name(ti);
-const chain = RT.methodsChain(RT.klassByName(full)).filter((m) => m.fn && !m.static && !/^(add_|remove_)/.test(m.name) && m.name.indexOf("<") < 0);
+const klass = RT.klassByName(full);
+const chain = (klass ? RT.methodsChain(klass) : []).filter((m) => m.fn && !/^(add_|remove_)/.test(m.name) && m.name.indexOf("<") < 0);
 leState.ti = ti; leState.methodList = chain;
-leHead.textContent = full + "  •  " + chain.length + " methods with code pointers  (click one to edit)";
+leHead.textContent = full + "  •  " + chain.length + " method(s) with code pointers  (click one to edit)";
 leList.innerHTML = "";
 const q = leSearch.value.trim().toLowerCase();
-chain.filter((m) => !q || m.name.toLowerCase().indexOf(q) >= 0).slice(0, 150).forEach((m) => {
-const sig = m.ret.replace("System.", "");
-const args = m.pars.map((p) => p.type.replace("System.", "")).join(", ");
-const r = el("div", { className: "tr" }, [el("div", { className: "nm link", textContent: m.name + "(" + args + ")", title: "ret: " + sig + "  •  fn=" + m.fn + "  •  mi=" + m.mi }), el("div", { className: "ty", textContent: sig })]);
+chain.filter((m) => !q || m.name.toLowerCase().indexOf(q) >= 0 || full.toLowerCase().indexOf(q) >= 0).slice(0, 150).forEach((m) => {
+const sig = shortType(m.ret);
+const args = m.pars.map((p) => shortType(p.type)).join(", ");
+const stat = m.static ? "static  " : "";
+const r = el("div", { className: "tr" + (leState.sel === m ? " on" : "") }, [el("div", { className: "nm link", textContent: stat + m.name + "(" + args + ")", title: full + "." + m.name + "  •  returns " + sig + "  •  table slot " + m.fn }), el("div", { className: "ty", textContent: sig })]);
 r.firstChild.onclick = () => leSelect(m);
+r.onclick = () => leSelect(m);
 leList.appendChild(r);
 });
 }
 function leSelect(m) {
 leState.sel = m;
-leOut.value = "// replace " + RT.klassName(RT.rw(RT.klassByName(RT.meta.name(leState.ti)) || 0) || "?") + "." + m.name + "\n// this pointer is available as thisPtr. Args: " + m.pars.map((p) => p.name + ":" + p.type.replace("System.", "")).join(", ") + "\n// return type: " + m.ret.replace("System.", "");
+Array.from(leList.children).forEach((c) => c.classList.remove("on"));
+const full = RT.meta.name(leState.ti);
+leOut.value = "// replace " + full + "." + m.name + (m.static ? "  (static)" : "") + "\n// Args: " + m.pars.map((p) => p.name + ": " + shortType(p.type)).join(", ") + "\n// Return type: " + shortType(m.ret) + "\n";
 leErr.style.display = "none";
 }
 function leApply() {
@@ -2151,38 +2661,51 @@ if (!leState.sel) { say("select a method first"); return; }
 const m = leState.sel;
 const src = leOut.value.trim();
 if (!src) { say("write some JavaScript to replace the method"); return; }
+let fn;
+try { fn = new Function("thisPtr", "args", "original", src); } catch (e) { leErr.textContent = friendlyErr(e); leErr.style.display = "block"; return; }
 try {
-const fn = new Function("thisPtr", "args", "original", src);
-const T = RT.table(); if (!T) throw new Error("no WASM table exposed on this build");
-const orig = T.get(m.fn);
-if (leState.orig && m.fn === leState.orig.fn) { T.set(m.fn, leState.orig.fn); leState.orig = null; }
-const tramp = function () {
-const thisPtr = arguments[0] || 0;
-const args = Array.from(arguments).slice(1, 1 + m.pars.length);
-try { return fn(thisPtr, args, orig); } catch (e) { dlog("[LiveEdit] error in replacement for " + m.name + ": " + (e.message || e)); return 0; }
+const sig = hookSig(m);
+if (!sig) throw new Error("this method has a struct parameter or return value, so it cannot be swapped safely");
+const T = RT.table(); if (!T) throw new Error("no WASM function table found on this build");
+if (!leState.swaps.has(m.fn)) { const probe = T.get(m.fn); if (!probe) throw new Error("function table slot " + m.fn + " is empty (abstract or stripped method)"); leState.swaps.set(m.fn, probe); }
+const origRef = leState.swaps.get(m.fn);
+const rc = sig[0];
+const js = function () {
+const raw = Array.prototype.slice.call(arguments);
+const thisPtr = m.static ? 0 : (raw[0] >>> 0);
+const argVals = m.static ? raw.slice(0, -1) : raw.slice(1, -1);
+const original = function () { return origRef.apply(null, raw); };
+try { const out = fn(thisPtr, argVals, original); return hcoerce(rc, out); } catch (e) { dlog("[LiveEdit] " + m.name + " threw: " + ((e && e.message) || e)); return hcoerce(rc, rc === "v" ? undefined : 0); }
 };
-T.set(m.fn, tramp);
-leState.orig = { fn: orig, sig: "" + m.fn };
+T.set(m.fn, buildTramp(sig, js));
 leErr.style.display = "none";
-say("LiveEdit active on " + m.name + " — call it in-game to trigger, or run ss.unlive() to revert");
+leShowMethods(leState.ti);
+say("LiveEdit active on " + m.name + " (" + leState.swaps.size + " swap(s) pending). The game calls your code instead of the original. Use Revert / Revert All to restore.");
 } catch (e) {
-leErr.textContent = "error: " + (e.message || e);
+leErr.textContent = friendlyErr(e);
 leErr.style.display = "block";
 }
 }
 function leRevert() {
-if (!leState.orig || !leState.sel) { say("nothing to revert"); return; }
-const T = RT.table(); if (!T) return;
-const m = leState.sel;
-T.set(m.fn, leState.orig.fn);
-leState.orig = null;
-say("reverted " + m.name);
+if (!leState.sel || !leState.swaps.has(leState.sel.fn)) { say("nothing to revert for this method"); return; }
+const T = RT.table(); if (!T) { say("no WASM table"); return; }
+try { T.set(leState.sel.fn, leState.swaps.get(leState.sel.fn)); } catch (e) { say("error: " + friendlyErr(e)); return; }
+say("reverted " + leState.sel.name);
+leState.swaps.delete(leState.sel.fn);
+leShowMethods(leState.ti);
+}
+function leRevertAll() {
+const T = RT.table(); if (!T) { say("no WASM table"); return; }
+let n = 0;
+for (const [fn2, origRef] of Array.from(leState.swaps)) { try { T.set(fn2, origRef); n++; leState.swaps.delete(fn2); } catch (e) {} }
+say("reverted " + n + " method(s)");
+leShowMethods(leState.ti);
 }
 leSearch.addEventListener("input", () => { leShowMethods(leState.ti); });
-const leCard = card("Live Edit (WASM hot-patch)", [leHead, leSearch, leList, leOut, el("div", { className: "btns" }, [btn("Apply Patch", leApply, "hot"), btn("Revert", leRevert, "")]), leErr, el("div", { className: "note", textContent: "Replaces the WASM indirect-function-table entry with your JS, so the game calls your code instead of the original. Use 'Revert' to restore. This is runtime-only and lost on reload." })], "hot");
+const leCard = card("Live Edit (WASM hot-patch)", [leHead, leSearch, leList, leOut, el("div", { className: "btns" }, [btn("Apply Patch", leApply, "hot"), btn("Revert", leRevert, ""), btn("Revert All", leRevertAll, "")]), leErr, el("div", { className: "note", textContent: "Compiles your JavaScript into a real WASM trampoline and swaps the function-table entry — exactly like the hook engine — so the game calls your code. Revert / Revert All restore the originals. Runtime-only, lost on reload." })], "hot");
 const subBar = el("div", { className: "sub" });
 const pageEx = el("div", { className: "pg hide" }, [subBar, exObjCard, exInspCard, exClsCard, exSrcCard, leCard]);
-function setSub(v) { ex.view = v; const o = v === "objects"; exObjCard.style.display = o ? "" : "none"; exInspCard.style.display = o ? "" : "none"; exClsCard.style.display = o ? "none" : ""; exSrcCard.style.display = o ? "none" : ""; leCard.style.display = o ? "none" : ""; Array.from(subBar.children).forEach((b) => b.classList.toggle("on", b.__v === v)); if (!o) clsRender(); }
+function setSub(v) { ex.view = v; const o = v === "objects"; exObjCard.style.display = o ? "" : "none"; exInspCard.style.display = o ? "" : "none"; exClsCard.style.display = o ? "none" : ""; exSrcCard.style.display = o ? "none" : ""; leCard.style.display = o ? "none" : ""; Array.from(subBar.children).forEach((b) => b.classList.toggle("on", b.__v === v)); ex.obj = null; ex.stack = []; ex.cls = null; leSelClear(); if (o) exRender(); else clsRender(); }
 [["objects", "Objects", "list"], ["classes", "Classes", "cube"], ["live", "Live Edit", "hot"]].forEach(([v, t, ic]) => { const b = btn(t, () => { setSub(v); if (v === "live" && leState.ti === null && srcState.ti !== null) leShowMethods(srcState.ti); }, "", ic); b.__v = v; subBar.appendChild(b); });
 
 // ===== CONSOLE =====
@@ -2246,9 +2769,9 @@ const GUI_RE = /(UnityEngine\.UI|UnityEngine\.Canvas)|\b(Text|Image|RawImage|UIL
 const guiState = { list: [], sel: null, busy: false, q: "", done: 0, hits: 0 };
 const guiEd = { text: "", r: 1, g: 1, b: 1, a: 1, x: 0, y: 0, z: 0, sx: 1, sy: 1, sz: 1 };
 const guiCam = { x: 0, y: 0, z: 0, zoom: 1 };
-function guiGet(o, name, argc) { const m = RT.findMethod(RT.rw(o), name, argc || 0); if (!m) return null; try { return RT.invokeF(m, o, []); } catch (e) { return null; } }
-function guiGoOf(o) { try { const go = guiGet(o, "get_gameObject", 0) >>> 0; if (go) return go; } catch (e) {} return /GameObject$/.test(RT.klassName(RT.rw(o)) || "") ? o : 0; }
-function guiActive(go) { try { return !!guiGet(go, "get_activeInHierarchy", 0); } catch (e) { return false; } }
+function guiGet(o, name, argc, pre) { if (!o || !RT.isLive(o)) return null; if (!pre && !isUnityObj(o)) return null; const m = RT.findMethod(RT.rw(o), name, argc || 0); if (!m) return null; try { return RT.invokeF(m, o, []); } catch (e) { return null; } }
+function guiGoOf(o, pre) { try { const go = guiGet(o, "get_gameObject", 0, pre) >>> 0; if (go) return go; } catch (e) {} return /GameObject$/.test(RT.klassName(RT.rw(o)) || "") ? o : 0; }
+function guiActive(go) { try { return !!guiGet(go, "get_activeInHierarchy", 0, true); } catch (e) { return false; } }
 async function scanGUI() {
 if (!RT || !RT.ok) { say("not connected yet"); return; }
 if (guiState.busy) return;
@@ -2261,12 +2784,12 @@ for (const o of objs) {
 guiState.done++;
 if (guiState.done % 50 === 0) { guiRender(); await new Promise(r => setTimeout(r, 0)); }
 try {
-if (!RT.inHeap(o) || !RT.isLive(o)) continue;
-const go = guiGoOf(o); if (!go || !RT.isLive(go) || !guiActive(go)) continue;
+if (!RT.inHeap(o) || !RT.isLive(o) || !isUnityObj(o)) continue;
+const go = guiGoOf(o, true); if (!go || !RT.isLive(go) || !guiActive(go)) continue;
 const name = unityName(go) || RT.klassName(RT.rw(o)) || "?";
 let pos = [0, 0, 0], scl = [1, 1, 1];
-const tr = guiGet(o, "get_transform") >>> 0;
-if (tr) { const p = guiGet(tr, "get_position"); if (Array.isArray(p) && p.length >= 3) pos = p; const s = guiGet(tr, "get_localScale"); if (Array.isArray(s) && s.length >= 3) scl = s; }
+const tr = guiGet(o, "get_transform", 0, true) >>> 0;
+if (tr) { const p = guiGet(tr, "get_position", 0, true); if (Array.isArray(p) && p.length >= 3) pos = p; const s = guiGet(tr, "get_localScale", 0, true); if (Array.isArray(s) && s.length >= 3) scl = s; }
 guiState.list.push({ addr: o, go, tr, name, cls: kn, pos, scl });
 guiState.hits++;
 if (guiState.list.length >= 3000) break;
