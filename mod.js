@@ -1,4 +1,4 @@
-/* Subway Surfers (Unity WebGL 2019.4, IL2CPP) mod, v8 (Clean Stable)
+/* Subway Surfers (Unity WebGL 2019.4, IL2CPP) mod, v9 (Final)
  * Load it in index.html BEFORE master-loader.js
  */
 (function () {
@@ -773,6 +773,35 @@ if (!hit.length) hit = all.filter((x) => x.name.toLowerCase() === q + "(clone)")
 if (!hit.length) hit = all.filter((x) => x.name.toLowerCase().indexOf(q) >= 0);
 return hit;
 }
+// ---------- diagnostics: learn the game's real object names by itself ----------
+function probeGame(silent) {
+if (!RT || !RT.ok) { if (!silent) say("not connected yet"); return; }
+try {
+const names = objectNames(true);
+const hist = {};
+for (const x of names) { const base = String(x.name).replace(/\(clone\)$/i, ""); hist[base] = (hist[base] || 0) + 1; }
+const assetRe = /coin|token|letter|magnet|jetpack|sneakers|mystery|multiplier|pogo|hover|train|wagon|barrier|ramp|rail|tunnel|gate|arch|powerup|pickup/i;
+const assetish = Object.keys(hist).filter((k) => assetRe.test(k)).sort((a, b) => hist[b] - hist[a]);
+const cls = [];
+for (const [full, tis] of (RT.meta ? RT.meta.byName : [])) {
+if (!/coin|pickup|powerup|train|wallet|score|spawn|placeholder|prefab|manager/i.test(full)) continue;
+let live = 0; for (const ti of tis) live += (RT.objs.get(ti) || []).length;
+if (live) cls.push(full + " [" + live + "]");
+}
+dlog("=== game probe ===");
+dlog("gameobjects indexed: " + names.length + " (unique names: " + Object.keys(hist).length + ")");
+dlog("asset-like names: " + (assetish.length ? assetish.slice(0, 25).map((k) => k + " x" + hist[k]).join(" | ") : "(none)"));
+dlog("classes with live objects: " + (cls.length ? cls.slice(0, 15).join(" | ") : "(none)"));
+dlog("most common names: " + Object.keys(hist).sort((a, b) => hist[b] - hist[a]).slice(0, 20).map((k) => k + " x" + hist[k]).join(", "));
+if (!silent) say("probe logged " + names.length + " objects, " + assetish.length + " asset-like names — see Log tab");
+} catch (e) { dlog("probe failed: " + (e && e.message)); }
+}
+let probedOnce = false;
+setInterval(() => {
+if (probedOnce || !RT || !RT.ok) return;
+probedOnce = true;
+setTimeout(() => { try { probeGame(true); } catch (e) {} }, 5000);
+}, 2000);
 
 // ---------- chunk weights ----------
 const C_CONT = "SYBO.Subway.Routes.WeightRandomizedPrefabContainter`2";
@@ -868,7 +897,7 @@ function pickupOnly(row, rows) { for (const r of rows) ovSet("pickupweights", r.
 // ---------- double coins FX ----------
 const coinFx = { auto: false, clones: new Set(), side: 1.5 };
 function unityInstantiate(obj) {
-for (const full of ["UnityEngine.Object", "Object"]) { try { const r = RT.staticCall(full, "Instantiate", [obj]); if (r) return r; } catch (e) {} }
+for (const full of ["UnityEngine.Object", "Object"]) { try { const r = RT.staticCall(full, "Instantiate", [obj]); if (r) return r; } catch (e) { dlog("Instantiate via " + full + " failed: " + (e && e.message)); } }
 return 0;
 }
 function unityDestroy(obj) {
@@ -876,7 +905,7 @@ for (const full of ["UnityEngine.Object", "Object"]) { try { RT.staticCall(full,
 return false;
 }
 function objTransform(o) { const m = RT.findMethod(RT.rw(o), "get_transform", 0); if (!m) return 0; try { return (RT.invokeF(m, o, []) >>> 0) || 0; } catch (e) { return 0; } }
-function objPos(o) { const t = objTransform(o); if (!t) return null; const m = RT.findMethod(RT.rw(t), "get_position", 0); if (!m) return null; try { const p = RT.invokeF(m, t, []); return Array.isArray(p) && p.length >= 3 ? p : null; } catch (e) { return null; } }
+function objPos(o) { return posOfObj(o); }
 function objSetPos(o, x, y, z) { const t = objTransform(o); if (!t) return false; try { guiVec3Set(t, "set_position", x, y, z); return true; } catch (e) { return false; } }
 function objEulerY(o) { const t = objTransform(o); if (!t) return null; const m = RT.findMethod(RT.rw(t), "get_eulerAngles", 0); if (!m) return null; try { const e = RT.invokeF(m, t, []); return Array.isArray(e) && e.length >= 2 ? e[1] : null; } catch (e2) { return null; } }
 function laneRightVec() {
@@ -886,8 +915,26 @@ if (yaw === null || !isFinite(yaw)) yaw = 0;
 const r = yaw * Math.PI / 180;
 return [Math.cos(r) * coinFx.side, 0, -Math.sin(r) * coinFx.side];
 }
+// GameObject-name discovery: Subway Surfers keeps its track objects as plain
+// GameObjects (Coin, Coin(Clone), Train...) with no coin class in metadata,
+// so the only reliable runtime handle is the prefab instance's name.
+function assetGOs(re) {
+const out = [];
+if (!RT || !RT.ok) return out;
+try { for (const x of objectNames()) { if (re.test(x.name)) out.push(x.ptr); } } catch (e) {}
+return out;
+}
+function assetGOInfo(re, limit) {
+const out = [];
+if (!RT || !RT.ok) return out;
+try { for (const x of objectNames()) { if (re.test(x.name)) { out.push(x); if (out.length >= (limit || 12)) break; } } } catch (e) {}
+return out;
+}
+function objActive(o) { const m = RT.findMethod(RT.rw(o), "get_activeSelf", 0); if (!m) return true; try { return !!RT.invokeF(m, o, []); } catch (e) { return true; } }
 function findCoinObjs() {
 if (!RT || !RT.ok) return [];
+const byName = assetGOs(/coin/i);
+if (byName.length) { const act = byName.filter((o) => objActive(o)); return act.length ? act : byName; }
 for (const n of ["SYBO.Subway.Pickups.Coin", "Pickups.Coin", "Coin"]) {
 try { const l = RT.liveAll(n); if (l && l.length) return l; } catch (e) {}
 }
@@ -903,7 +950,13 @@ return out;
 function doubleCoinsOnce(silent) {
 if (!RT || !RT.ok) throw new Error("not connected yet");
 const coins = findCoinObjs().filter((c) => !coinFx.clones.has(c));
-if (!coins.length) { if (!silent) say("no coins on the track right now"); return 0; }
+if (!coins.length) {
+if (!silent) {
+try { const all = objectNames(); dlog("double coins: 0 coin objects found; " + all.length + " GameObjects indexed; sample: " + all.slice(0, 8).map((x) => x.name).join(", ")); } catch (e) {}
+say("no coins on the track right now — run the Probe button or type ss.dump() in Console");
+}
+return 0;
+}
 const rv = laneRightVec();
 let n = 0;
 for (const c of coins.slice(0, 300)) {
@@ -1445,6 +1498,7 @@ return null;
 },
 objects: (a) => { if (!RT || !RT.ok) return "not connected"; const q = a[0] ? String(csArg(a[0])).toLowerCase() : ""; return objectNames(true).filter((o) => !q || o.name.toLowerCase().includes(q)).slice(0, 200).map((o) => "0x" + o.ptr.toString(16).padStart(8, "0") + "  " + o.name); },
 classes: (a) => { if (!RT || !RT.ok) return "not connected"; const q = a[0] ? String(csArg(a[0])).toLowerCase() : "", out = []; for (const [full, tis] of (RT.meta ? RT.meta.byName : [])) { if (q && !full.toLowerCase().includes(q)) continue; const live = tis.reduce((n, ti) => n + ((RT.objs.get(ti) || []).length), 0); out.push(full + (live ? "  [" + live + " live]" : "")); if (out.length >= 400) break; } return out; },
+dump: () => { probeGame(false); return "probe logged to the Log tab"; },
 diag: () => { const M = getModule(); return ["module: " + (M ? "yes" : "no"), "RT: " + (RT ? (RT.connected ? "connected" : "not connected") : "null"), "RT.ok: " + (RT ? !!RT.ok : false), "RT.status: " + (RT ? RT.status : "n/a"), "classes: " + (RT && RT.kinv ? RT.kinv.size : 0), "objects: " + ((RT && RT.total) || 0), "layout: " + JSON.stringify((RT && RT.L) || null)].join("\n"); },
 scanFirst: (a) => msScanSync(String(a[1] ? csArg(a[1]) : "int32"), +csArg(a[0])),
 scanNext: (a) => { const t = String(a[1] ? csArg(a[1]) : "int32"), v = +csArg(a[0]); const prev = Array.isArray(a[2]) ? csArg(a[2]) : MS.prev; return msNextScan(t, v, prev); },
@@ -1737,7 +1791,7 @@ const groupSw = (id) => sw(() => groupOn(id), (v) => { if (v && (!RT || !RT.ok))
 const copyText = (t) => { try { (window.navigator.clipboard).writeText(t); say("copied"); } catch (e) { say("copy failed"); } };
 
 let FR = null, PANEL = null, BODY = null, bodyEls = {};
-function buildUI() {
+function buildUIInner() {
 FR = document.createElement("iframe");
 FR.title = "Subway Surfers mod";
 FR.setAttribute("allowtransparency", "true");
@@ -1760,7 +1814,7 @@ place();
 const statDot = el("div", { className: "d" }), statTxt = el("span", { textContent: "starting..." });
 const stat = el("div", { className: "stat" }, [statDot, statTxt, ibtn("refresh", () => { if (RT && RT.ok) RT.refresh(false); say("refreshing objects"); }, "refresh the object list")]);
 const minBtn = el("button", { className: "hb", title: "minimize" }, [icon("min", 14)]);
-const head = el("div", { className: "h" }, [el("div", { className: "logo" }, [icon("spawn", 18)]), el("div", { className: "ttl1" }, [D.createTextNode("Subway Surfers"), el("span", { className: "pro", textContent: "PRO" }), el("small", { textContent: "mod menu v8" })]), el("div", { className: "sp" }), minBtn]);
+const head = el("div", { className: "h" }, [el("div", { className: "logo" }, [icon("spawn", 18)]), el("div", { className: "ttl1" }, [D.createTextNode("Subway Surfers"), el("span", { className: "pro", textContent: "PRO" }), el("small", { textContent: "mod menu v9" })]), el("div", { className: "sp" }), minBtn]);
 
 // ===== SPAWN =====
 const chunkOut = el("div", { className: "tbl" }), chunkHead = el("div", { className: "note" });
@@ -1825,36 +1879,18 @@ el("div", { className: "ttl" }, [D.createTextNode("Spawn weights")]), pkOut,
 el("div", { className: "btns" }, [btn("Refresh list", pkRender, "", "refresh")])
 ], "spawn");
 
-const injectSel = el("select", { className: "sel" });
-const macroName = el("input", { type: "text", className: "txt", placeholder: "name for a custom button..." });
-const macroCode = el("textarea", { className: "txt", spellcheck: false, placeholder: "// Custom macro code\n// ss.wallet(\"coins\", 1000000)\n// ss.grant(\"Jetpack\")" });
-const macroBox = el("div", { className: "btns" });
-const injectTypes = ["Jetpack", "CoinMagnet", "SuperSneakers", "JetPack", "MysteryBox", "MultiplierScore2x", "MysteryPowerup", "LetterHuntCharacter", "SuperMysteryBox", "TokenHunt", "LetterHuntDaily", "PogoStick", "Headstart"];
-injectTypes.forEach((t) => injectSel.appendChild(el("option", { value: t, textContent: t })));
 const injectCard = card("Memory Injection", [
-el("div", { className: "note", textContent: "These buttons write directly into the game's memory structures to grant effects. Powerup buttons (Jetpack/Magnet/Sneakers) freeze timers on already-active powerups. Headstart manipulates run start state. 'Replace Coins' forces a specific pickup type at every spawn point." }),
+el("div", { className: "note", textContent: "These buttons write directly into the game's memory structures to grant effects. Powerup buttons (Jetpack/Magnet/Sneakers) freeze timers on already-active powerups. Headstart manipulates run start state." }),
 el("div", { className: "btns" }, [
 btn("Jetpack", () => { try { say(ss.grant("Jetpack")); } catch (e) { say(e.message); } }, "hot"),
 btn("Magnet", () => { try { say(ss.grant("Magnet")); } catch (e) { say(e.message); } }, ""),
 btn("Sneakers", () => { try { say(ss.grant("Sneakers")); } catch (e) { say(e.message); } }, ""),
 btn("Headstart", () => { try { say(ss.grant("Headstart")); } catch (e) { say(e.message); } }, "")
-]),
-el("div", { className: "row", style: "margin-top:8px" }, [lbl("Replace coins with"), injectSel]),
-el("div", { className: "btns" }, [btn("Replace all Coins", () => {
-if (!RT || !RT.ok) { say("not connected yet"); return; }
-pk.force = injectSel.value;
-try {
-const mode = (RT.enumOf(P_MODE) || []).find((x) => x.name === "WillForcePickupType");
-const val = pickupTypeValue(pk.force);
-const spots = P_SPOT ? RT.find(P_SPOT).filter((o) => { try { return RT.isLive(o); } catch (e) { return false; } }) : [];
-if (spots.length) {
-const sample = spots[0];
-try { const info = RT.inspect(sample); if (info) dlog("spawn point fields: " + info.fields.map((f) => f.name + ":" + f.kind).join(", ")); } catch (e) {}
-}
-setGroup("force", true);
-say(spots.length ? "forcing " + pk.force + " — pinned " + spots.length + " live spawn point(s) (mode " + (mode ? mode.value : "?") + ", type " + val + "). New road chunks spawn " + pk.force + " instead of coins." : "no live spawn points found yet — start a run first");
-} catch (e) { say("error: " + (e.message || e)); } }, "hot")])
+])
 ], "spawn");
+const macroName = el("input", { type: "text", className: "txt", placeholder: "name for a custom button..." });
+const macroCode = el("textarea", { className: "txt", spellcheck: false, placeholder: "// Custom macro code\n// ss.wallet(\"coins\", 1000000)\n// ss.grant(\"Jetpack\")" });
+const macroBox = el("div", { className: "btns" });
 
 // ===== Destructive Mode =====
 const DM_INT = 2147483647;   // integer limit, per user request
@@ -1928,7 +1964,7 @@ function dmSwap(on, match, info, swaps, hint) {
   dlog("dmSwap: scanned " + scanned + " methods, no match. Samples with related names:\n" + (maybe.join("\n") || "  (none — this build may use different identifiers)"));
   return "no matching method found (scanned " + scanned + "). Related names logged (Log tab) — tell me which one to NOP";
 }
-const dmHeadNop = () => say(dmSwap(true, (m) => /canuseheadstart/i.test(m.name) || (/headstart/i.test(m.owner + "." + m.name) && /canuse|available|check|valid|count|max|limit/i.test(m.name)) || /^get_canuseheadstart/i.test(m.name) || /headstart/i.test(m.name) && m.pars.length === 0 && (m.ret === "System.Boolean" || m.ret === "System.Int32"), 1, dmHeadSwaps, /headstart/i));
+const dmHeadNop = () => say(dmSwap(true, (m) => /canuseheadstart/i.test(m.name) || (/headstart/i.test(m.owner + "." + m.name) && /canuse|available|check|valid|count|max|limit/i.test(m.name)) || (/headstart/i.test(m.name) && m.pars.length === 0 && (m.ret === "System.Boolean" || m.ret === "System.Int32")), 1, dmHeadSwaps, /headstart/i));
 const dmHeadRestore = () => say(dmSwap(false, null, 1, dmHeadSwaps));
 const dmTimerNop = () => say(dmSwap(true, (m) => /powerup/i.test(m.owner + "." + m.name) && /update|tick|decrement|shrink|reduce|expire|elapse|countdown|decrease|down|consume/i.test(m.name), 0, dmTimerSwaps, /powerup|timeleft/i));
 const dmTimerRestore = () => say(dmSwap(false, null, 0, dmTimerSwaps));
@@ -2011,7 +2047,34 @@ const dmCard = card("Destructive Mode", [
   el("div", { className: "btns" }, [btn("Inject from thin air", () => { try { say(injectPowerup(dmSel.value)); } catch (e) { say(e.message); } }, "hot")])
 ], "spawn");
 
-const tuneCard = card("Powerup tuning", TUNE.map((t) => el("div", { className: "row" }, [lbl(t.title, t.sub), RR(num(() => S.vals[t.id], (v) => { S.vals[t.id] = v; persist(); }, true), groupSw(t.id))])), "spawn");
+function timerMethodJson() {
+if (!RT || !RT.ok) throw new Error("not connected yet — press this again once the green dot is on");
+const out = [];
+for (const entry of (RT.meta.byName || [])) {
+const full = entry[0]; if (!/powerup|timer|countdown/i.test(full)) continue;
+for (const ti of entry[1]) {
+const k0 = (RT.klassOf.get(ti) || [])[0]; if (!k0) continue;
+let src = ""; try { src = RT.classSource(ti) || ""; } catch (e) {}
+if (src && !/timeLeft/i.test(src)) continue;
+let ms; try { ms = RT.methodsChain(k0); } catch (e) { continue; }
+for (const m of ms) {
+if (!m.fn || m.pars.length > 2) continue;
+if (!/update|tick|decrement|shrink|reduce|expire|elapse|countdown|consume|decrease|down/i.test(m.name)) continue;
+const line = src ? (src.split("\n").find((l) => /timeLeft\s*(--|-=|-)/.test(l)) || "") : "";
+out.push({ owner: full, name: m.name, isStatic: !!m.static, ret: m.ret, pars: m.pars.map((p) => ({ name: p.name, type: p.type })), fn: m.fn, mi: m.mi, line: String(line).trim() });
+if (out.length >= 12) break;
+}
+if (out.length >= 12) break;
+}
+if (out.length >= 12) break;
+}
+if (!out.length) throw new Error("no powerup countdown candidate found — start a run, grab a powerup, then press again");
+const json = JSON.stringify(out, null, 1);
+let ok = false; try { copyText(json); ok = true; } catch (e) {}
+dlog("timer method candidates:\n" + json);
+return ok ? "copied " + out.length + " candidate(s) — paste it to me" : "logged " + out.length + " candidate(s) in the Log tab — copy it from there";
+}
+const tuneCard = card("Powerup tuning", TUNE.map((t) => el("div", { className: "row" }, [lbl(t.title, t.sub), RR(num(() => S.vals[t.id], (v) => { S.vals[t.id] = v; persist(); }, true), groupSw(t.id))])).concat([el("div", { className: "btns" }, [btn("Copy timer method JSON (for the WASM patch)", () => { try { say(timerMethodJson()); } catch (e) { say(String(e.message || e)); } }, "", "copy")])]), "spawn");
 const macroCard = card("My buttons", [
 macroName, macroCode,
 el("div", { className: "btns" }, [btn("Save code as button", () => { const n = macroName.value.trim(); if (!n || !macroCode.value.trim()) { say("give it a name and some code"); return; } S.macros.push({ name: n, code: macroCode.value }); persist(); drawMacros(); macroName.value = ""; macroCode.value = ""; }, "", "plus")]),
@@ -2022,7 +2085,7 @@ macroBox, el("div", { className: "note", textContent: "Right-click or long-press
 const CE_PAL = [
 ["Coin", "#ffd60a", [0.45, 0.45, 0.45], /coin/i],
 ["Train", "#8d99ae", [1.0, 1.0, 3.0], /train/i],
-["Train Car", "#6c757d", [1.0, 1.0, 2.4], /wagon|\bcar\b|railcar/i],
+["Train Car", "#6c757d", [1.0, 1.0, 2.4], /wagon|railcar|train\s*car|traincar/i],
 ["Jetpack", "#ff5d8f", [0.6, 1.0, 0.6], /jet/i],
 ["Magnet", "#4cc9f0", [0.7, 0.7, 0.7], /magnet/i],
 ["Sneakers", "#80ed99", [0.7, 0.5, 0.7], /sneak/i],
@@ -2031,7 +2094,7 @@ const CE_PAL = [
 ["2x Multiplier", "#ffb703", [0.7, 0.7, 0.7], /multiplier/i],
 ["Barrier", "#ef233c", [1.0, 1.0, 0.4], /barrier|obstacle/i],
 ["Ramp", "#fb8500", [1.0, 0.5, 1.0], /ramp/i],
-["Rail", "#5a5a5a", [0.3, 0.12, 3.0], /rail|track/i],
+["Rail", "#5a5a5a", [0.3, 0.12, 3.0], /rail/i],
 ["Tunnel", "#6d6875", [2.4, 2.0, 1.0], /tunnel/i],
 ["Token", "#ffc8dd", [0.5, 0.5, 0.5], /token/i],
 ["Letter", "#cdb4db", [0.4, 0.7, 0.2], /letter/i],
@@ -2183,6 +2246,7 @@ if (ceStroke.tool === "line" && ceStroke.a && ceStroke.b) for (const c of ceLine
 ceStroke = null;
 }
 function ceTemplate(re) {
+const g = assetGOs(re); if (g.length) return g[0];
 try { for (const e of RT.meta.byName) { if (!re.test(e[0])) continue; for (const ti of e[1]) for (const o of (RT.objs.get(ti) || [])) { try { if (RT.isLive(o) && isUnityObj(o)) return o; } catch (x) {} } } } catch (e) {}
 return 0;
 }
@@ -2197,7 +2261,7 @@ const tpl = {}; let n = 0; const missed = [];
 for (let y = 0; y < CE.gy; y++) for (let z = 0; z < CE.gz; z++) for (let x = 0; x < CE.gx; x++) {
 const idx = CE.cells[ceIdx(x, y, z)]; if (!idx) continue;
 const pal = CE_PAL[idx - 1];
-if (!(pal.name in tpl)) tpl[pal.name] = ceTemplate(pal[3]);
+if (!(pal.name in tpl)) { tpl[pal.name] = ceTemplate(pal[3]); const hit = tpl[pal.name] ? "found" : "MISSING"; try { const s = assetGOInfo(pal[3], 3); dlog("asset " + pal.name + ": " + hit + (s.length ? " (e.g. " + s.map((o) => o.name).join(", ") + ")" : "")); } catch (e) {} }
 const t = tpl[pal.name]; if (!t) { if (missed.indexOf(pal.name) < 0) missed.push(pal.name); continue; }
 const wx = p[0] + right[0] * (x - cx) * cs + fwd[0] * (z - cz) * cs, wz = p[2] + right[2] * (x - cx) * cs + fwd[2] * (z - cz) * cs, wy = p[1] + 1 + y * cs;
 let cl = 0; try { cl = unityInstantiate(t) >>> 0; } catch (e) { cl = 0; }
@@ -2355,8 +2419,10 @@ R_(lbl("Open the editor", "Esc closes · Enter applies · fullscreen keeps keys 
 // render loop (only redraws when something changed)
 let ceRaf = 0;
 function ceLoop() {
-if (CE.open && ceDirty) { ceDirty = false; ceDraw(); }
 ceRaf = requestAnimationFrame(ceLoop);
+if (!CE.open || !ceDirty) return;
+ceDirty = false;
+try { ceDraw(); } catch (e) { dlog("chunk editor render error: " + (e && e.message)); }
 }
 ceLoop();
 
@@ -2364,7 +2430,7 @@ const dcCard = card("Double Coins FX", [
 el("div", { className: "note", textContent: "Clones every coin on the track and shifts each copy one lane to the side, so a real 2x / Double Coins mystery powerup literally shows twice as many coins around you. Clones are tracked, so auto mode never doubles the doubles." }),
 R_(lbl("Auto-duplicate while 2x / Double Coins is active", "checks once a second while the powerup runs"), sw(() => coinFx.auto, (v) => { coinFx.auto = v; say(v ? "auto double-coins on" : "auto double-coins off"); })),
 R_(lbl("Lane shift", "how far sideways each copy lands"), num(() => coinFx.side, (v) => { coinFx.side = Math.max(0.5, Math.min(6, v)); }, true)),
-el("div", { className: "btns" }, [btn("Duplicate all coins now", () => { try { doubleCoinsOnce(false); } catch (e) { say(String(e.message || e)); } }, "hot", "plus"), btn("Remove my duplicates", clearCoinClones, "", "undo")])
+el("div", { className: "btns" }, [btn("Duplicate all coins now", () => { try { doubleCoinsOnce(false); } catch (e) { say(String(e.message || e)); } }, "hot", "plus"), btn("Remove my duplicates", clearCoinClones, "", "undo"), btn("Probe track assets", () => { try { probeGame(false); } catch (e) { say(String(e.message || e)); } }, "", "scan")])
 ], "plus");
 
 const pageSpawn = el("div", { className: "pg" }, [pickCard, dcCard, chunkCard, tuneCard, injectCard, dmCard, ceCard, macroCard]);
@@ -3040,11 +3106,39 @@ setInterval(() => { ex.locks.forEach((L) => { try { RT.write(L.a, L.f, L.v); } c
 
 applyLook(); drawMacros(); setSub("objects");
 setTab(S.tab >= 0 && S.tab < TABS.length ? S.tab : 0);
-dlog("Subway Surfers mod v8 ready");
+dlog("Subway Surfers mod v9 ready");
 }
 
-if (document.body) buildUI(); else addEventListener("DOMContentLoaded", buildUI);
+// ----- safe bootstrap: the panel rebuilds itself if the game ever kills it -----
+function safeBuildUI() {
+try { buildUIInner(); return true; }
+catch (e) {
+dlog("menu build failed: " + (e && e.message || e));
+try { if (FR && FR.parentNode) FR.parentNode.removeChild(FR); } catch (x) {}
+FR = null;
+setTimeout(safeBuildUI, 3000);
+return false;
+}
+}
+let reopenBtn = null;
+function syncReopen() {
+try {
+if (!reopenBtn) {
+reopenBtn = document.createElement("button");
+reopenBtn.textContent = "PRO";
+reopenBtn.title = "reopen the mod menu";
+reopenBtn.style.cssText = "position:fixed;right:10px;bottom:10px;z-index:2147483647;background:linear-gradient(135deg,#e8b23d,#c78a1e);color:#1a1304;border:0;border-radius:12px;padding:6px 10px;font:700 11px monospace;cursor:pointer;display:none;box-shadow:0 2px 8px rgba(0,0,0,.5)";
+reopenBtn.onclick = () => { safeBuildUI(); reopenBtn.style.display = "none"; };
+document.body.appendChild(reopenBtn);
+}
+reopenBtn.style.display = (FR && FR.isConnected) ? "none" : "block";
+} catch (e) {}
+}
+setInterval(() => {
+try { if (!FR || !FR.isConnected) syncReopen(); } catch (e) {}
+}, 3000);
+if (document.body) safeBuildUI(); else addEventListener("DOMContentLoaded", safeBuildUI);
 window.__ssRT = () => RT;
-dlog("Subway Surfers mod v8 loaded, stable");
+dlog("Subway Surfers mod v9 loaded, stable");
 
 })();
