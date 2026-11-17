@@ -878,10 +878,20 @@ let devArmed = false;
 function devEnsure() {
 if (!RT || !RT.ok) { say("not connected yet"); return false; }
 if (RT.liveAll(DEVC).length) return true;
-if (!devArmed) { devArmed = true; say("DebugSettings does not exist yet. Switch again to create"); return false; }
-devArmed = false;
-try { const k = RT.klassByName(DEVC), m = k && RT.methodsChain(k).find((x) => x.static && /^get_instance$/i.test(x.name) && x.pars.length === 0); if (!m) { say("no instance getter"); return false; } RT.invoke(m, 0, []); RT.refresh(false); say("created, switch it on once more"); } catch (e) { say("error: " + e.message); }
-return false;
+const k = RT.klassByName(DEVC);
+if (!k) { say("DebugSettings class not indexed yet — wait for the first scan"); return false; }
+try {
+const fs = RT.klassFields(k) || [];
+let sz = 16;
+for (const f of fs) { const hi = (f.off || 0) + (f.size || 4); if (hi > sz) sz = hi; }
+const p = RT.M._malloc(sz + 16);
+const dv = new DataView(RT.M.HEAPU8.buffer);
+dv.setInt32(p, k, true);
+for (const f of fs) { if (f.isStatic) continue; try { if (f.kind === "bool") dv.setUint8(p + (f.off || 0), 1); } catch (e) {} }
+RT.refresh(false);
+say("DebugSettings allocated manually (" + hex(p) + ") — switch a setting on again");
+return true;
+} catch (e) { say("error: " + (e.message || e)); return false; }
 }
 const DEV = [
 { f: "_characterInvincible", title: "Character invincible", sub: "crashes cannot end the run", set: "set_CharacterInvincible" },
@@ -1249,17 +1259,26 @@ function findPlayerPtr() {
 if (!RT || !RT.ok) return 0;
 try {
 const g = RT.singleton("SYBO.Subway.Game");
-if (g && RT.isLive(g)) { const info = RT.inspect(g); if (info) for (const f of info.fields) { if (f.isStatic || !/player|character|avatar/i.test(f.name)) continue; try { const v = RT.read(g, f) >>> 0; if (v && RT.inHeap(v) && RT.inspect(v) && RT.isLive(v)) return v; } catch (e) {} } }
+if (g && RT.isLive(g)) { const info = RT.inspect(g); if (info) for (const f of info.fields) { if (f.isStatic || !/player|character|avatar/i.test(f.name)) continue; try { const v = RT.read(g, f) >>> 0; if (v && RT.inHeap(v) && RT.isLive(v) && isUnityObj(v)) return v; } catch (e) {} } }
 } catch (e) {}
 return 0;
+}
+function isUnityObj(p) {
+if (!RT || !RT.ok) return false;
+try {
+if (!p) return false;
+const i = RT.inspect(p); if (!i) return false;
+const chain = (i.parents || []).join("|") + "|" + (i.name || "");
+return /UnityEngine\.(GameObject|Component|Behaviour|MonoBehaviour)/.test(chain);
+} catch (e) { return false; }
 }
 const CSB = {
 find: (a) => {
 const x = csArg(a[0]); if (typeof x !== "string") return a[0]; if (!RT || !RT.ok) return null;
 const name = x, short = name.slice(name.lastIndexOf(".") + 1).toLowerCase();
-const c = csClass(name); if (c) { const o = RT.singleton(c); if (o && RT.isLive(o)) return new Ptr(o); const live = RT.liveAll(c); if (live.length) return new Ptr(live[0]); }
-let hits = findByName(name); if (!hits.length) { try { objectNames(true); } catch (e) {} hits = findByName(name); } hits = hits.filter((h) => { try { return RT.isLive(h.ptr); } catch (e) { return false; } }); if (hits.length) return new Ptr(hits[0].ptr);
-for (const [full, tis] of (RT.meta ? RT.meta.byName : [])) { const s = full.slice(full.lastIndexOf(".") + 1).replace(/`\d+$/, "").toLowerCase(); if (s !== short) continue; for (const ti of tis) { const l = RT.objs.get(ti); if (l && l.length && RT.isLive(l[0])) return new Ptr(l[0]); } }
+const c = csClass(name); if (c) { const o = RT.singleton(c); if (o && RT.isLive(o) && isUnityObj(o)) return new Ptr(o); const live = RT.liveAll(c).filter(isUnityObj); if (live.length) return new Ptr(live[0]); }
+let hits = findByName(name); if (!hits.length) { try { objectNames(true); } catch (e) {} hits = findByName(name); } hits = hits.filter((h) => { try { return RT.isLive(h.ptr) && isUnityObj(h.ptr); } catch (e) { return false; } }); if (hits.length) return new Ptr(hits[0].ptr);
+for (const [full, tis] of (RT.meta ? RT.meta.byName : [])) { const s = full.slice(full.lastIndexOf(".") + 1).replace(/`\d+$/, "").toLowerCase(); if (s !== short) continue; for (const ti of tis) { const l = RT.objs.get(ti); if (l && l.length && RT.isLive(l[0]) && isUnityObj(l[0])) return new Ptr(l[0]); } }
 const pp = findPlayerPtr(); if (pp) return new Ptr(pp);
 return null;
 },
@@ -1651,8 +1670,28 @@ el("div", { className: "ttl" }, [D.createTextNode("Spawn weights")]), pkOut,
 el("div", { className: "btns" }, [btn("Refresh list", pkRender, "", "refresh")])
 ], "spawn");
 
-const tuneCard = card("Powerup tuning", TUNE.map((t) => el("div", { className: "row" }, [lbl(t.title, t.sub), RR(num(() => S.vals[t.id], (v) => { S.vals[t.id] = v; persist(); }, true), groupSw(t.id))])), "spawn");
-const pageSpawn = el("div", { className: "pg" }, [pickCard, chunkCard, tuneCard]);
+const injectSel = el("select", { className: "sel" });
+const injectTypes = ["Jetpack", "CoinMagnet", "SuperSneakers", "JetPack", "MysteryBox", "MultiplierScore2x", "MysteryPowerup", "LetterHuntCharacter", "SuperMysteryBox", "TokenHunt", "LetterHuntDaily", "PogoStick", "Headstart"];
+injectTypes.forEach((t) => injectSel.appendChild(el("option", { value: t, textContent: t })));
+const injectCard = card("Memory Injection", [
+el("div", { className: "note", textContent: "These buttons write directly into the game's memory structures to grant effects. Powerup buttons (Jetpack/Magnet/Sneakers) freeze timers on already-active powerups. Headstart manipulates run start state. 'Replace Coins' forces a specific pickup type at every spawn point." }),
+el("div", { className: "btns" }, [
+btn("Jetpack", () => { try { say(ss.grant("Jetpack")); } catch (e) { say(e.message); } }, "hot"),
+btn("Magnet", () => { try { say(ss.grant("Magnet")); } catch (e) { say(e.message); } }, ""),
+btn("Sneakers", () => { try { say(ss.grant("Sneakers")); } catch (e) { say(e.message); } }, ""),
+btn("Headstart", () => { try { say(ss.grant("Headstart")); } catch (e) { say(e.message); } }, "")
+]),
+el("div", { className: "row", style: "margin-top:8px" }, [lbl("Replace coins with"), injectSel]),
+el("div", { className: "btns" }, [btn("Replace all Coins", () => { pk.force = injectSel.value; setGroup("force", true); say("forcing " + pk.force + " at every spawn point"); }, "hot")])
+], "spawn");
+
+const macroCard = card("My buttons", [
+macroName, macroCode,
+el("div", { className: "btns" }, [btn("Save code as button", () => { const n = macroName.value.trim(); if (!n || !macroCode.value.trim()) { say("give it a name and some code"); return; } S.macros.push({ name: n, code: macroCode.value }); persist(); drawMacros(); macroName.value = ""; macroCode.value = ""; }, "", "plus")]),
+macroBox, el("div", { className: "note", textContent: "Right-click or long-press a custom button to delete it. Try: ss.wallet('coins', 1000000) or ss.grant('Jetpack')" })
+], "console");
+
+const pageSpawn = el("div", { className: "pg" }, [pickCard, chunkCard, tuneCard, injectCard, macroCard]);
 
 // ===== SCAN =====
 function ssScanEl() {
@@ -1897,9 +1936,9 @@ function setSub(v) { ex.view = v; const o = v === "objects"; exObjCard.style.dis
 [["objects", "Objects", "list"], ["classes", "Classes", "cube"]].forEach(([v, t, ic]) => { const b = btn(t, () => setSub(v), "", ic); b.__v = v; subBar.appendChild(b); });
 
 // ===== CONSOLE =====
-const conIn = el("textarea", { className: "txt", spellcheck: false, placeholder: "// C# on the live game\nvar jake = find(\"Jake\");\nif (jake != null) {\n  var t = jake.transform;\n  t.localScale = new Vector3(2f, 2f, 2f);\n}" });
-const conOut = el("pre", { className: "out", textContent: "(output)" }), macroBox = el("div", { className: "btns" });
 const macroName = el("input", { type: "text", className: "txt", placeholder: "name for a custom button..." });
+const macroCode = el("textarea", { className: "txt", spellcheck: false, placeholder: "// Custom macro code\n// ss.wallet(\"coins\", 1000000)\n// ss.grant(\"Jetpack\")" });
+const macroBox = el("div", { className: "btns" });
 const api = {
 get RT() { return RT; }, log: LOG, hex,
 find: (c) => (RT ? RT.find(c) : []),
@@ -1943,12 +1982,6 @@ const names = new Set(defs.map((d) => d.name));
 S.macros = defs.concat(S.macros.filter((m) => !names.has(m.name)));
 persist();
 }
-const pageCon = el("div", { className: "pg hide" }, [
-card("Custom code", [conIn, el("div", { className: "btns" }, [btn("Run", () => { try { const v = runCode(conIn.value); conOut.textContent = v === undefined ? "ok" : (typeof v === "object" ? JSON.stringify(v, null, 1) : String(v)); } catch (e) { conOut.textContent = "error: " + (e.message || e); } }, "hot", "play"), btn("Clear", () => { conIn.value = ""; conOut.textContent = "(output)"; }, "", "trash")]), el("div", { className: "btns" }, [btn("To Frida JS", () => { conOut.textContent = looksJS(conIn.value) ? "// this is already JavaScript" : csToFrida(conIn.value); }, "", "console"), btn("Copy output", () => copyText(conOut.textContent), "", "copy")]), conOut,
-el("div", { className: "note", textContent: "C# subset on the live game. Try: diag(); player(); objects(\"jake\"); classes(\"player\"); find(\"Jake\"); if (find(\"Jake\") != null) find(\"Jake\").transform.localScale = new Vector3(2,2,2); scanFirst(1234); scanNext(1234, prev); scanWrite(addr, 999); Type help. JavaScript with ss.* still works too." })], "console"),
-card("My buttons", [macroName, el("div", { className: "btns" }, [btn("Save code as button", () => { const n = macroName.value.trim(); if (!n || !conIn.value.trim()) { say("give it a name and some code"); return; } S.macros.push({ name: n, code: conIn.value }); persist(); drawMacros(); macroName.value = ""; }, "", "plus")]), macroBox, el("div", { className: "note", textContent: "Right-click or long-press a custom button to delete it." })], "console")
-]);
-
 // ===== SAVE =====
 const saveInfo = el("pre", { className: "out" }), saveTa = el("textarea", { className: "txt", spellcheck: false, placeholder: "export / import text" });
 let wipeArmed = 0;
@@ -2137,7 +2170,7 @@ el("div", { className: "note", textContent: "Drag the header to move the panel a
 card("Log", [logOut, el("div", { className: "btns" }, [btn("Copy log", () => copyText(LOG.join("\n")), "", "copy")])], "list")
 ]);
 
-const TABS = [["Spawn", "spawn", pageSpawn], ["Scan", "scan", pageScan], ["GUI", "list", pageGui], ["Dev", "dev", pageDev], ["Explore", "explorer", pageEx], ["Code", "console", pageCon], ["Save", "save", pageSave], ["Prefs", "prefs", pagePrefs]];
+const TABS = [["Spawn", "spawn", pageSpawn], ["Scan", "scan", pageScan], ["GUI", "list", pageGui], ["Dev", "dev", pageDev], ["Explore", "explorer", pageEx], ["Save", "save", pageSave], ["Prefs", "prefs", pagePrefs]];
 const pill = el("div", { className: "pill" }); pill.style.width = "calc((100% - 6px) / " + TABS.length + ")";
 const tabEls = TABS.map(([name, ic], i) => { const t = el("div", { className: "tab" }, [icon(ic, 16), D.createTextNode(name)]); t.onclick = () => setTab(i); return t; });
 const setTab = (i) => {
