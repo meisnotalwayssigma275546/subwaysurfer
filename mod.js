@@ -910,16 +910,26 @@ function walletAdd(kind, n) {
 if (!RT || !RT.ok) throw new Error("not connected yet");
 const want = kind === "coins" ? "coin" : "key";
 const re = new RegExp(want, "i");
-const intish = (f) => ["int", "uint", "long", "ulong", "short", "ushort", "byte"].indexOf(f.kind) >= 0;
+const intish = (f) => ["int", "uint", "long", "ulong", "short", "ushort", "byte", "float", "double"].indexOf(f.kind) >= 0;
 const inv = RT.singleton(INV);
 const found = [];
-const rdV = (obj, f) => { try { const v = RT.read(obj, f); return v === undefined ? null : (f.kind === "long" || f.kind === "ulong" ? Number(v) : f.kind === "int" || f.kind === "short" || f.kind === "sbyte" ? v | 0 : v); } catch (e) { return null; } };
+const rdV = (obj, f) => { try { const v = RT.read(obj, f); if (v === undefined) return null; if (f.kind === "long" || f.kind === "ulong") return Number(v); if (f.kind === "int" || f.kind === "uint") return v | 0; if (f.kind === "float" || f.kind === "double") return +v; return v; } catch (e) { return null; } };
+const commonNames = ["_coins", "_keys", "_totalCoins", "_totalKeys", "_balance", "_money", "_curr", "_score", "_multiplier"];
+const addCommon = (obj, f) => { for (const cn of commonNames) { if (f.name === cn || f.name.endsWith(cn)) { found.push({ f, obj, tag: "inst", v: intish(f) ? rdV(obj, f) : null }); return; } } };
 if (inv) { try { const info = RT.inspect(inv); if (info) for (const f of info.fields) { if (f.isConst) continue; found.push({ f, obj: inv, tag: "inst", v: intish(f) ? rdV(inv, f) : null }); } } catch (e) {} }
 const k = RT.klassByName ? RT.klassByName(INV) : 0;
 if (k) for (const f of RT.klassFields(k)) { if (f.isConst || !intish(f)) continue; found.push({ f, obj: 0, tag: "static", v: rdV(0, f) }); }
-const dump = () => dlog("wallet debug [" + INV + "] singleton=" + (inv ? "0x" + inv.toString(16) : "MISSING") + "\n" + (found.length ? found.map((x) => x.tag + " " + x.f.name + ":" + x.f.kind + (x.f.isStatic ? " (static)" : "") + (x.v !== null ? " = " + x.v : "")).join("\n") : "(no readable fields — instance not found or metadata not ready)"));
-const score = (x) => (/_total/i.test(x.f.name) ? 4 : 0) + (/^_?(coins|keys)$/i.test(x.f.name) ? 2 : 0) + (x.tag === "inst" ? 1 : 0) + (x.f.kind === "int" || x.f.kind === "uint" ? 1 : 0);
-const hits = found.filter((x) => intish(x.f) && re.test(x.f.name)).sort((a, b) => score(b) - score(a));
+// Also scan instance fields for common alternate names
+if (inv) { try { const info = RT.inspect(inv); if (info) for (const f of info.fields) { if (f.isConst) continue; addCommon(inv, f); } } catch (e) {} }
+const dump = () => {
+  const lines = [];
+  if (inv) { try { const info = RT.inspect(inv); if (info) for (const f of info.fields) { if (f.isConst) continue; lines.push("inst " + f.name + ":" + f.kind + " = " + (intish(f) ? rdV(inv, f) : "(not int)")); } } catch (e) { lines.push("error reading instance: " + (e.message || e)); } }
+  else lines.push("(instance not found / not live)");
+  if (k) for (const f of RT.klassFields(k)) { if (f.isConst || !intish(f)) continue; lines.push("static " + f.name + ":" + f.kind + " = " + rdV(0, f)); }
+  dlog("wallet debug [" + INV + "] singleton=" + (inv ? "0x" + inv.toString(16) : "MISSING") + "\n" + (lines.length ? lines.join("\n") : "(no fields found)"));
+};
+const score = (x) => (/_total/i.test(x.f.name) ? 4 : 0) + (/^_?(coins|keys)$/i.test(x.f.name) ? 2 : 0) + (x.tag === "inst" ? 1 : 0) + (x.f.kind === "int" || x.f.kind === "uint" ? 2 : x.f.kind === "long" || x.f.kind === "ulong" ? 1.5 : x.f.kind === "float" || x.f.kind === "double" ? 1.2 : 0);
+const hits = found.filter((x) => intish(x.f) && (re.test(x.f.name) || commonNames.includes(x.f.name))).sort((a, b) => score(b) - score(a));
 if (!inv) { dump(); throw new Error("InventorySave singleton missing — open the main menu first. Field dump logged (copy it with the Log tab)"); }
 if (!hits.length) { dump(); throw new Error("no integer field containing \"" + want + "\" was found on InventorySave (" + found.length + " fields). The exact field names and types are in the log (Log tab) — paste them to the fix list"); }
 const pick = hits[0], field = pick.f, obj = pick.obj;
@@ -1671,6 +1681,9 @@ el("div", { className: "btns" }, [btn("Refresh list", pkRender, "", "refresh")])
 ], "spawn");
 
 const injectSel = el("select", { className: "sel" });
+const macroName = el("input", { type: "text", className: "txt", placeholder: "name for a custom button..." });
+const macroCode = el("textarea", { className: "txt", spellcheck: false, placeholder: "// Custom macro code\n// ss.wallet(\"coins\", 1000000)\n// ss.grant(\"Jetpack\")" });
+const macroBox = el("div", { className: "btns" });
 const injectTypes = ["Jetpack", "CoinMagnet", "SuperSneakers", "JetPack", "MysteryBox", "MultiplierScore2x", "MysteryPowerup", "LetterHuntCharacter", "SuperMysteryBox", "TokenHunt", "LetterHuntDaily", "PogoStick", "Headstart"];
 injectTypes.forEach((t) => injectSel.appendChild(el("option", { value: t, textContent: t })));
 const injectCard = card("Memory Injection", [
@@ -1685,6 +1698,7 @@ el("div", { className: "row", style: "margin-top:8px" }, [lbl("Replace coins wit
 el("div", { className: "btns" }, [btn("Replace all Coins", () => { pk.force = injectSel.value; setGroup("force", true); say("forcing " + pk.force + " at every spawn point"); }, "hot")])
 ], "spawn");
 
+const tuneCard = card("Powerup tuning", TUNE.map((t) => el("div", { className: "row" }, [lbl(t.title, t.sub), RR(num(() => S.vals[t.id], (v) => { S.vals[t.id] = v; persist(); }, true), groupSw(t.id))])), "spawn");
 const macroCard = card("My buttons", [
 macroName, macroCode,
 el("div", { className: "btns" }, [btn("Save code as button", () => { const n = macroName.value.trim(); if (!n || !macroCode.value.trim()) { say("give it a name and some code"); return; } S.macros.push({ name: n, code: macroCode.value }); persist(); drawMacros(); macroName.value = ""; macroCode.value = ""; }, "", "plus")]),
@@ -1930,15 +1944,81 @@ srcOut.textContent = RT.classSource(ti); srcOut.scrollTop = 0;
 clsSearch.addEventListener("input", () => { clearTimeout(clsSearch.__t); clsSearch.__t = setTimeout(clsRender, 200); });
 const exClsCard = card("Classes", [clsSearch, clsList], "cube");
 const exSrcCard = card("C# preview (view only)", [srcHead, srcOut, el("div", { className: "btns" }, [btn("Copy", () => copyText(srcOut.textContent), "", "copy"), btn("Live objects", () => { const ti = srcState.ti; if (ti === null) return; ex.cls = ti; ex.objs = (RT.objs.get(ti) || []).slice(0, 60); ex.obj = null; ex.stack = []; setSub("objects"); exRender(); }, "", "list")])], "console");
+// ===== Live Edit (WASM hot-patching) =====
+const leState = { ti: null, methodList: [], sel: null, orig: null, origSig: "" };
+const leSearch = el("input", { type: "text", className: "txt", placeholder: "search methods (e.g. get_position, Update, FixedUpdate)...", spellcheck: false });
+const leList = el("div", { className: "tbl" });
+const leHead = el("div", { className: "note", textContent: "select a class in Classes, then click a method below" });
+const leOut = el("textarea", { className: "txt", spellcheck: false, placeholder: "// JavaScript to replace the method. Signature: (thisPtr, ...args) or (...args) for static.\n// Example: return 30; // force speed to 30\n// Example: return; // no-op (void methods)" });
+leOut.style.cssText = "min-height:120px;font:11px/1.4 " + MONO + ";width:100%;box-sizing:border-box;background:#160d04;color:#f5dfb2;border:1px solid #4a2c14;border-radius:6px;padding:6px 8px;";
+const leErr = el("pre", { className: "out", textContent: "" });
+leErr.style.cssText = "display:none;font:11px/1.3 " + MONO + ";color:#ff6b6b;background:#2a0a0a;border:1px solid #5a1a1a;border-radius:6px;padding:6px 8px;margin-top:4px;white-space:pre-wrap;max-height:100px;overflow:auto;";
+function leRender() {
+leList.innerHTML = "";
+leHead.textContent = "select a class in Classes, then click a method below";
+leOut.value = ""; leErr.style.display = "none"; leErr.textContent = ""; leState.ti = null; leState.methodList = []; leState.sel = null;
+}
+function leShowMethods(ti) {
+if (!RT || !RT.ok || ti === null || ti === undefined) return;
+const full = RT.meta.name(ti);
+const chain = RT.methodsChain(RT.klassByName(full)).filter((m) => m.fn && !m.static && !/^(add_|remove_)/.test(m.name) && m.name.indexOf("<") < 0);
+leState.ti = ti; leState.methodList = chain;
+leHead.textContent = full + "  •  " + chain.length + " methods with code pointers  (click one to edit)";
+leList.innerHTML = "";
+const q = leSearch.value.trim().toLowerCase();
+chain.filter((m) => !q || m.name.toLowerCase().indexOf(q) >= 0).slice(0, 150).forEach((m) => {
+const sig = m.ret.replace("System.", "");
+const args = m.pars.map((p) => p.type.replace("System.", "")).join(", ");
+const r = el("div", { className: "tr" }, [el("div", { className: "nm link", textContent: m.name + "(" + args + ")", title: "ret: " + sig + "  •  fn=" + m.fn + "  •  mi=" + m.mi }), el("div", { className: "ty", textContent: sig })]);
+r.firstChild.onclick = () => leSelect(m);
+leList.appendChild(r);
+});
+}
+function leSelect(m) {
+leState.sel = m;
+leOut.value = "// replace " + RT.klassName(RT.rw(RT.klassByName(RT.meta.name(leState.ti)) || 0) || "?") + "." + m.name + "\n// this pointer is available as thisPtr. Args: " + m.pars.map((p) => p.name + ":" + p.type.replace("System.", "")).join(", ") + "\n// return type: " + m.ret.replace("System.", "");
+leErr.style.display = "none";
+}
+function leApply() {
+if (!leState.sel) { say("select a method first"); return; }
+const m = leState.sel;
+const src = leOut.value.trim();
+if (!src) { say("write some JavaScript to replace the method"); return; }
+try {
+const fn = new Function("thisPtr", "args", "original", src);
+const T = RT.table(); if (!T) throw new Error("no WASM table exposed on this build");
+const orig = T.get(m.fn);
+if (leState.orig && m.fn === leState.orig.fn) { T.set(m.fn, leState.orig.fn); leState.orig = null; }
+const tramp = function () {
+const thisPtr = arguments[0] || 0;
+const args = Array.from(arguments).slice(1, 1 + m.pars.length);
+try { return fn(thisPtr, args, orig); } catch (e) { dlog("[LiveEdit] error in replacement for " + m.name + ": " + (e.message || e)); return 0; }
+};
+T.set(m.fn, tramp);
+leState.orig = { fn: orig, sig: "" + m.fn };
+leErr.style.display = "none";
+say("LiveEdit active on " + m.name + " — call it in-game to trigger, or run ss.unlive() to revert");
+} catch (e) {
+leErr.textContent = "error: " + (e.message || e);
+leErr.style.display = "block";
+}
+}
+function leRevert() {
+if (!leState.orig || !leState.sel) { say("nothing to revert"); return; }
+const T = RT.table(); if (!T) return;
+const m = leState.sel;
+T.set(m.fn, leState.orig.fn);
+leState.orig = null;
+say("reverted " + m.name);
+}
+leSearch.addEventListener("input", () => { leShowMethods(leState.ti); });
+const leCard = card("Live Edit (WASM hot-patch)", [leHead, leSearch, leList, leOut, el("div", { className: "btns" }, [btn("Apply patch", leApply, "hot"), btn("Revert", leRevert, "")]), leErr, el("div", { className: "note", textContent: "Replaces the WASM indirect-function-table entry with your JS, so the game calls your code instead of the original. Use 'Revert' to restore. This is runtime-only and lost on reload." })], "hot");
 const subBar = el("div", { className: "sub" });
-const pageEx = el("div", { className: "pg hide" }, [subBar, exObjCard, exInspCard, exClsCard, exSrcCard]);
-function setSub(v) { ex.view = v; const o = v === "objects"; exObjCard.style.display = o ? "" : "none"; exInspCard.style.display = o ? "" : "none"; exClsCard.style.display = o ? "none" : ""; exSrcCard.style.display = o ? "none" : ""; Array.from(subBar.children).forEach((b) => b.classList.toggle("on", b.__v === v)); if (!o) clsRender(); }
-[["objects", "Objects", "list"], ["classes", "Classes", "cube"]].forEach(([v, t, ic]) => { const b = btn(t, () => setSub(v), "", ic); b.__v = v; subBar.appendChild(b); });
+const pageEx = el("div", { className: "pg hide" }, [subBar, exObjCard, exInspCard, exClsCard, exSrcCard, leCard]);
+function setSub(v) { ex.view = v; const o = v === "objects"; exObjCard.style.display = o ? "" : "none"; exInspCard.style.display = o ? "" : "none"; exClsCard.style.display = o ? "none" : ""; exSrcCard.style.display = o ? "none" : ""; leCard.style.display = o ? "none" : ""; Array.from(subBar.children).forEach((b) => b.classList.toggle("on", b.__v === v)); if (!o) clsRender(); }
+[["objects", "Objects", "list"], ["classes", "Classes", "cube"], ["live", "Live Edit", "hot"]].forEach(([v, t, ic]) => { const b = btn(t, () => { setSub(v); if (v === "live" && leState.ti === null && srcState.ti !== null) leShowMethods(srcState.ti); }, "", ic); b.__v = v; subBar.appendChild(b); });
 
 // ===== CONSOLE =====
-const macroName = el("input", { type: "text", className: "txt", placeholder: "name for a custom button..." });
-const macroCode = el("textarea", { className: "txt", spellcheck: false, placeholder: "// Custom macro code\n// ss.wallet(\"coins\", 1000000)\n// ss.grant(\"Jetpack\")" });
-const macroBox = el("div", { className: "btns" });
 const api = {
 get RT() { return RT; }, log: LOG, hex,
 find: (c) => (RT ? RT.find(c) : []),
@@ -2259,11 +2339,11 @@ if (HK.size) text += "  \u2022  " + HK.size + " hooked";
 stat.className = "stat " + state; statTxt.textContent = text;
 saveInfo.textContent = "engine save sync: " + SAVE.engine + "\nbackup files: " + SAVE.files + (SAVE.lastBackup ? "  (last " + new Date(SAVE.lastBackup).toLocaleTimeString() + ")" : "") + "\nrestored this session: " + SAVE.restored + (SAVE.err ? "\nnote: " + SAVE.err : "");
 if (S.tab === 6) logOut.textContent = LOG.slice(-60).join("\n");
-if (S.tab === 2 && RT && RT.ok) {
+if (S.tab === 3 && RT && RT.ok) {
 const f = RT.liveAll(DEVC)[0];
 devActiveSel.textContent = f ? "DebugSettings found (" + hex(f) + ")" : "DebugSettings does not exist yet, the game only creates it on demand. Switch a setting on twice to try creating it.";
 }
-if (S.tab === 3) exRows.forEach(([inp, f, a]) => { if (D.activeElement === inp) return; try { const s = VEC_SIZES[f.tn] ? (csFieldVal(a, f) || []).join(",") : (f.enumTi >= 0 ? String(RT.read(a, f)) : RT.show(a, f)); if (inp.value !== s) inp.value = s; } catch (e) {} });
+if (S.tab === 4) exRows.forEach(([inp, f, a]) => { if (D.activeElement === inp) return; try { const s = VEC_SIZES[f.tn] ? (csFieldVal(a, f) || []).join(",") : (f.enumTi >= 0 ? String(RT.read(a, f)) : RT.show(a, f)); if (inp.value !== s) inp.value = s; } catch (e) {} });
 }, 600);
 setInterval(() => { ex.locks.forEach((L) => { try { RT.write(L.a, L.f, L.v); } catch (e) {} }); }, 100);
 
