@@ -755,14 +755,14 @@ const vf = RT.klassFields(RT.rw(v)).find((x) => !x.isStatic && x.kind === "bool"
 return vf ? !!RT.read(v, vf) : true;
 }
 function unityName(p) {
-try { if (!p || !RT.isLive(p)) return null; const m = RT.methodsChain(RT.rw(p)).find((x) => x.name === "get_name" && x.pars.length === 0 && !x.static); if (!m) return null; const r = RT.invokeF(m, p, []); return typeof r === "string" ? r : null; } catch (e) { return null; }
+try { if (!p || !RT.isLive(p)) return null; if (!isUnityObj(p)) return null; const m = RT.methodsChain(RT.rw(p)).find((x) => x.name === "get_name" && x.pars.length === 0 && !x.static); if (!m) return null; const r = RT.invokeF(m, p, []); return typeof r === "string" ? r : null; } catch (e) { return null; }
 }
 let nameCache = { t: 0, list: [] };
 function objectNames(force) {
 if (!RT || !RT.ok) return [];
 if (!force && Date.now() - nameCache.t < 5000) return nameCache.list;
 const list = [], base = RT.cls("UnityEngine.GameObject") || [];
-for (const ti of RT.subTypesOf(base, "UnityEngine.GameObject")) for (const o of (RT.objs.get(ti) || [])) { const n = unityName(o); if (n) list.push({ ptr: o, name: n }); }
+for (const ti of RT.subTypesOf(base, "UnityEngine.GameObject")) for (const o of (RT.objs.get(ti) || [])) { if (!isUnityObj(o)) continue; const n = unityName(o); if (n) list.push({ ptr: o, name: n }); }
 nameCache = { t: Date.now(), list }; return list;
 }
 function findByName(name) {
@@ -955,6 +955,31 @@ let n = 0;
 for (const o of live) { const tag = tagOf(o); if (tag && !re.test(tag)) continue; const f = RT.fieldOf(o, "timeLeft"); if (!f) continue; try { RT.write(o, f, 30000000); n++; } catch (e) {} }
 if (!n) { for (const o of live) { const f = RT.fieldOf(o, "timeLeft"); if (!f) continue; try { RT.write(o, f, 30000000); n++; } catch (e) {} } return "tag unmatched; refreshed all " + n + " active timer(s)"; }
 return "froze " + n + " " + (hit ? hit[0] : "powerup") + " timer(s) at max";
+}
+
+// ---------- livePatch: direct byte write fallback ----------
+// Maps className + methodName -> m.fn (table index), then tries func_index = elem[m.fn - 1]
+// (the indirect-function-table element map, if this build exposes one) and writes the
+// raw bytes of hexString into Module.HEAPU8 at that offset. NOTE: the compiled WASM code
+// does NOT live in linear memory — for actually replacing a method's behaviour use the
+// Live Edit card (indirect-function-table swap). This is a raw heap-write escape hatch.
+function livePatch(className, methodName, hexString) {
+  if (!RT || !RT.ok) throw new Error("not connected yet");
+  const M = getModule(); if (!M || !M.HEAPU8) throw new Error("game module not ready");
+  const hx = String(hexString).replace(/[^0-9a-fA-F]+/g, " ").trim();
+  if (!hx) throw new Error("hex string is empty");
+  const bytes = [];
+  for (const t of hx.split(/\s+/)) { const b = parseInt(t, 16); if (isNaN(b)) throw new Error("bad hex byte: " + t); bytes.push(b & 0xff); }
+  const k = RT.klassByName(className);
+  if (!k) throw new Error("class not found: " + className);
+  let m = null;
+  for (const meth of RT.methodsChain(k)) if (meth.name === methodName) { m = meth; break; }
+  if (!m) throw new Error("method not found: " + className + "." + methodName);
+  let elem = null;
+  for (const src of [M, M.exports, M.asm]) { if (src && Array.isArray(src.elem)) { elem = src.elem; break; } if (src && src.__elem && Array.isArray(src.__elem)) { elem = src.__elem; break; } }
+  const funcIndex = elem ? (Number(elem[m.fn - 1]) >>> 0) : (m.fn >>> 0);
+  for (let i = 0; i < bytes.length; i++) M.HEAPU8[funcIndex + i] = bytes[i];
+  return "livePatch: wrote " + bytes.length + " byte(s) at 0x" + funcIndex.toString(16) + " for " + className + "." + methodName + "  (m.fn=" + m.fn + ", func_index=" + funcIndex + ")";
 }
 
 // ---------- safety ----------
@@ -1698,6 +1723,147 @@ el("div", { className: "row", style: "margin-top:8px" }, [lbl("Replace coins wit
 el("div", { className: "btns" }, [btn("Replace all Coins", () => { pk.force = injectSel.value; setGroup("force", true); say("forcing " + pk.force + " at every spawn point"); }, "hot")])
 ], "spawn");
 
+// ===== Destructive Mode =====
+const DM_INT = 2147483647;   // integer limit, per user request
+const DM_TIMER = 30000000;   // timeLeft value already used by grantPowerup
+const DM_RE = {
+  head: /headstart/i,
+  speed: /maxspeed|max_speed|speedcap|speed_cap|speedlimit|speed_limit|maxspeedvalue/i,
+  mult: /maxmultiplier|multipliercap|multiplier_cap|maxmult|multiplierlimit|max_multiplier|maxscoremultiplier/i,
+  timer: /timeleft/i
+};
+const dmIntKind = (k) => ["int", "uint", "long", "ulong"].indexOf(k) >= 0;
+let dmCache = null, dmCacheT = 0, dmCacheScan = -1;
+function dmCacheGet() {
+  const now = Date.now();
+  if (dmCache && now - dmCacheT < 2000 && RT && RT.lastScan === dmCacheScan) return dmCache;
+  const head = [], speed = [], mult = [], timer = [];
+  if (RT && RT.ok && RT.kinv) {
+    for (const [k, ti] of RT.kinv) {
+      let fields; try { fields = RT.klassFields(k); } catch (e) { fields = null; }
+      if (!fields) continue;
+      const objs = RT.objs.get(ti) || []; if (!objs.length) continue;
+      let timerCls = false; try { timerCls = /powerup/i.test(RT.klassName(k) || ""); } catch (e) {}
+      for (const f of fields) {
+        if (f.isStatic || !f.name) continue;
+        const n = f.name.toLowerCase();
+        let dst = null;
+        if (DM_RE.head.test(n) && dmIntKind(f.kind)) dst = head;
+        else if (DM_RE.speed.test(n) && (dmIntKind(f.kind) || f.kind === "float" || f.kind === "double")) dst = speed;
+        else if (DM_RE.mult.test(n) && (dmIntKind(f.kind) || f.kind === "float" || f.kind === "double")) dst = mult;
+        else if (timerCls && DM_RE.timer.test(n) && (f.kind === "float" || f.kind === "double")) dst = timer;
+        if (!dst) continue;
+        for (const o of objs) { try { if (RT.isLive(o)) dst.push([o, f]); } catch (e) {} }
+      }
+    }
+  }
+  dmCache = { head, speed, mult, timer };
+  dmCacheT = now; dmCacheScan = RT ? RT.lastScan : -1;
+  return dmCache;
+}
+defGroup("dmhead", () => dmCacheGet().head.map(([o, f]) => [o, f, DM_INT]));
+defGroup("dmspeed", () => dmCacheGet().speed.map(([o, f]) => [o, f, DM_INT]));
+defGroup("dmmult", () => dmCacheGet().mult.map(([o, f]) => [o, f, DM_INT]));
+defGroup("dmtimer", () => dmCacheGet().timer.map(([o, f]) => [o, f, DM_TIMER]));
+// WASM indirect-function-table NOPs (runtime-only, revertible)
+const dmHeadSwaps = [], dmTimerSwaps = [];
+function dmSwap(on, match, info, swaps) {
+  if (!RT || !RT.ok) return "not connected yet";
+  const T = RT.table(); if (!T) return "no WASM function table on this build";
+  if (!on) { let n = 0; while (swaps.length) { const s = swaps.pop(); try { T.set(s.fn, s.orig); n++; } catch (e) {} } return "restored " + n + " original method(s)"; }
+  const names = [];
+  for (const [k] of RT.kinv) {
+    let ms; try { ms = RT.methodsChain(k); } catch (e) { continue; }
+    for (const m of ms) {
+      if (!match(m)) continue;
+      if (swaps.some((s) => s.fn === m.fn)) continue;
+      try { const orig = T.get(m.fn); T.set(m.fn, m.ret === "System.Void" ? function () {} : function () { return info; }); swaps.push({ fn: m.fn, orig, name: m.owner + "." + m.name }); names.push(m.owner + "." + m.name); } catch (e) {}
+    }
+  }
+  return names.length ? ("NOPed " + names.length + " method(s): " + names.slice(0, 6).join(", ")) : "no matching method found";
+}
+const dmHeadNop = () => say(dmSwap(true, (m) => /canuseheadstart/i.test(m.name) || (/headstart/i.test(m.owner + "." + m.name) && /canuse|available|check|valid/i.test(m.name)), 1, dmHeadSwaps));
+const dmHeadRestore = () => say(dmSwap(false, null, 1, dmHeadSwaps));
+const dmTimerNop = () => say(dmSwap(true, (m) => /activepowerup/i.test(m.owner) && /update|tick|decrement|shrink|reduce|expire|elapse|countdown|down/i.test(m.name), 0, dmTimerSwaps));
+const dmTimerRestore = () => say(dmSwap(false, null, 0, dmTimerSwaps));
+function dmScanHolders() {
+  const out = [];
+  if (!RT || !RT.ok || !RT.kinv) return out;
+  for (const [k, ti] of RT.kinv) {
+    let fields; try { fields = RT.klassFields(k); } catch (e) { continue; }
+    if (!fields) continue;
+    const objs = RT.objs.get(ti) || []; if (!objs.length) continue;
+    for (const f of fields) {
+      if (f.isStatic || !f.name) continue;
+      if (!/activepowerup|_powerups|activepowerups|^powerups$/.test(f.name.toLowerCase())) continue;
+      if (["object", "array", "ptr", "generic", "struct"].indexOf(f.kind) < 0) continue;
+      for (const o of objs) { try { if (RT.isLive(o)) out.push([o, f]); } catch (e) {} }
+    }
+  }
+  return out;
+}
+function injectPowerup(typeName) {
+  if (!RT || !RT.ok) throw new Error("not connected yet");
+  const q = String(typeName).toLowerCase();
+  const tpls = RT.liveAll("Info.ActivePowerup");
+  const tpl = tpls && tpls.length ? tpls[0] : 0;
+  if (!tpl) throw new Error("no Info.ActivePowerup instance yet — grab any powerup in a run first");
+  let setType = "";
+  const tff = ["type", "_type", "powerupType", "_powerupType", "powerUpType", "_powerUpType", "pickupType", "_pickupType", "powerup", "_powerup", "kind", "_kind"];
+  for (const nm2 of tff) {
+    const f = RT.fieldOf(tpl, nm2); if (!f) continue;
+    try {
+      if (f.kind === "string") { RT.write(tpl, f, RT.newString(typeName)); setType = nm2 + "(string)"; break; }
+      if (f.enumTi >= 0 && RT.meta && RT.meta.enumMembers) {
+        const em = RT.meta.enumMembers(f.enumTi) || [];
+        const hit = em.find((x) => x.name && x.name.toLowerCase().indexOf(q) >= 0) || em.find((x) => x.name && q.indexOf(String(x.name).toLowerCase()) >= 0);
+        if (hit) { RT.write(tpl, f, hit.value); setType = nm2 + "(" + hit.name + ")"; break; }
+      }
+    } catch (e) {}
+  }
+  const tlf = RT.fieldOf(tpl, "timeLeft");
+  if (tlf) try { RT.write(tpl, tlf, DM_TIMER); } catch (e) {}
+  const msg = setType ? ("typed as " + setType) : "type field not found, timer frozen";
+  for (const [o, f] of dmScanHolders()) {
+    let v; try { v = RT.read(o, f) >>> 0; } catch (e) { continue; }
+    if (!v || !RT.inHeap(v)) continue;
+    const fi = RT.fieldOf(v, "_items"), fs = RT.fieldOf(v, "_size");
+    if (fi && fs) {
+      try {
+        const arr = RT.read(v, fi) >>> 0, size = RT.read(v, fs) | 0;
+        if (arr && RT.inHeap(arr)) {
+          const cap = Math.min(RT.rw(arr + 12) >>> 0, 4000);
+          if (size < cap) {
+            RT.M.HEAPU32[(arr + 16 + size * 4) >>> 2] = tpl >>> 0;
+            RT.write(v, fs, size + 1);
+            return msg + "; appended to List at index " + size + " (size " + size + " -> " + (size + 1) + ")";
+          }
+          return msg + "; List is full (size " + size + " = capacity " + cap + ") — instance configured in place";
+        }
+      } catch (e) {}
+    }
+    try {
+      const ai = RT.arrayInfo(v);
+      if (ai && /activepowerup/i.test(ai.el || "") && ai.len > 0) { RT.M.HEAPU32[(v + 16) >>> 2] = tpl >>> 0; return msg + "; wrote instance into ActivePowerup[] slot 0 (of " + ai.len + ")"; }
+    } catch (e) {}
+  }
+  return msg + "; no ActivePowerup List/Array field found on live objects — instance configured in place";
+}
+const dmTypes = ["Jetpack", "CoinMagnet", "SuperSneakers", "PogoStick", "MultiplierScore2x", "MysteryBox", "Headstart"];
+const dmSel = el("select", { className: "sel", style: "width:150px" });
+dmTypes.forEach((t) => dmSel.appendChild(el("option", { value: t, textContent: t })));
+const dmCard = card("Destructive Mode", [
+  el("div", { className: "note", textContent: "Removes the game's arbitrary limits. Every write targets live objects and is revertible (toggle off, or Restore). Integer limit = 2147483647. Extreme values can crash the game — that's on you." }),
+  R_(lbl("Infinite headstart stacking", "removes the headstart clamp"), groupSw("dmhead")),
+  R_(lbl("Uncap speed", "speed ceiling -> integer limit"), groupSw("dmspeed")),
+  R_(lbl("Uncap score multiplier", "multiplier cap -> integer limit"), groupSw("dmmult")),
+  R_(lbl("Infinite powerup timers", "timeLeft re-frozen every scan"), groupSw("dmtimer")),
+  el("div", { className: "btns" }, [btn("NOP headstart checks", dmHeadNop, "hot"), btn("Restore checks", dmHeadRestore, "")]),
+  el("div", { className: "btns" }, [btn("NOP powerup decrement", dmTimerNop, "hot"), btn("Restore decrement", dmTimerRestore, "")]),
+  el("div", { className: "row", style: "margin-top:8px" }, [lbl("Inject powerup", "spawn one out of thin air"), dmSel]),
+  el("div", { className: "btns" }, [btn("Inject from thin air", () => { try { say(injectPowerup(dmSel.value)); } catch (e) { say(e.message); } }, "hot")])
+], "spawn");
+
 const tuneCard = card("Powerup tuning", TUNE.map((t) => el("div", { className: "row" }, [lbl(t.title, t.sub), RR(num(() => S.vals[t.id], (v) => { S.vals[t.id] = v; persist(); }, true), groupSw(t.id))])), "spawn");
 const macroCard = card("My buttons", [
 macroName, macroCode,
@@ -1705,7 +1871,7 @@ el("div", { className: "btns" }, [btn("Save code as button", () => { const n = m
 macroBox, el("div", { className: "note", textContent: "Right-click or long-press a custom button to delete it. Try: ss.wallet('coins', 1000000) or ss.grant('Jetpack')" })
 ], "console");
 
-const pageSpawn = el("div", { className: "pg" }, [pickCard, chunkCard, tuneCard, injectCard, macroCard]);
+const pageSpawn = el("div", { className: "pg" }, [pickCard, chunkCard, tuneCard, injectCard, dmCard, macroCard]);
 
 // ===== SCAN =====
 function ssScanEl() {
@@ -1951,6 +2117,7 @@ const leList = el("div", { className: "tbl" });
 const leHead = el("div", { className: "note", textContent: "select a class in Classes, then click a method below" });
 const leOut = el("textarea", { className: "txt", spellcheck: false, placeholder: "// JavaScript to replace the method. Signature: (thisPtr, ...args) or (...args) for static.\n// Example: return 30; // force speed to 30\n// Example: return; // no-op (void methods)" });
 leOut.style.cssText = "min-height:120px;font:11px/1.4 " + MONO + ";width:100%;box-sizing:border-box;background:#160d04;color:#f5dfb2;border:1px solid #4a2c14;border-radius:6px;padding:6px 8px;";
+leOut.readOnly = false; leOut.disabled = false; try { leOut.removeAttribute("readonly"); leOut.removeAttribute("disabled"); leOut.removeAttribute("disabled"); } catch (e) {}
 const leErr = el("pre", { className: "out", textContent: "" });
 leErr.style.cssText = "display:none;font:11px/1.3 " + MONO + ";color:#ff6b6b;background:#2a0a0a;border:1px solid #5a1a1a;border-radius:6px;padding:6px 8px;margin-top:4px;white-space:pre-wrap;max-height:100px;overflow:auto;";
 function leRender() {
@@ -2012,7 +2179,7 @@ leState.orig = null;
 say("reverted " + m.name);
 }
 leSearch.addEventListener("input", () => { leShowMethods(leState.ti); });
-const leCard = card("Live Edit (WASM hot-patch)", [leHead, leSearch, leList, leOut, el("div", { className: "btns" }, [btn("Apply patch", leApply, "hot"), btn("Revert", leRevert, "")]), leErr, el("div", { className: "note", textContent: "Replaces the WASM indirect-function-table entry with your JS, so the game calls your code instead of the original. Use 'Revert' to restore. This is runtime-only and lost on reload." })], "hot");
+const leCard = card("Live Edit (WASM hot-patch)", [leHead, leSearch, leList, leOut, el("div", { className: "btns" }, [btn("Apply Patch", leApply, "hot"), btn("Revert", leRevert, "")]), leErr, el("div", { className: "note", textContent: "Replaces the WASM indirect-function-table entry with your JS, so the game calls your code instead of the original. Use 'Revert' to restore. This is runtime-only and lost on reload." })], "hot");
 const subBar = el("div", { className: "sub" });
 const pageEx = el("div", { className: "pg hide" }, [subBar, exObjCard, exInspCard, exClsCard, exSrcCard, leCard]);
 function setSub(v) { ex.view = v; const o = v === "objects"; exObjCard.style.display = o ? "" : "none"; exInspCard.style.display = o ? "" : "none"; exClsCard.style.display = o ? "none" : ""; exSrcCard.style.display = o ? "none" : ""; leCard.style.display = o ? "none" : ""; Array.from(subBar.children).forEach((b) => b.classList.toggle("on", b.__v === v)); if (!o) clsRender(); }
@@ -2032,7 +2199,7 @@ call: (a, n, ...args) => { const m = RT.findMethod(RT.rw(a), n, args.length); if
 callStatic: (cls, n, ...args) => RT.staticCall(cls, n, args),
 runtimeInvoke: (mi, obj, ...args) => RT.runtimeInvoke(mi, obj, args),
 newString: (s) => RT.newString(s),
-hook: HOOKS, cs: (src) => csRun(src), frida: (src) => csToFrida(src), wallet: (k, n) => walletAdd(k, n), grant: (k) => grantPowerup(k), gui: () => scanGUI(), names: () => objectNames(true), source: (ti) => RT.classSource(ti), inRun: () => inRun(),
+hook: HOOKS, cs: (src) => csRun(src), frida: (src) => csToFrida(src), wallet: (k, n) => walletAdd(k, n), grant: (k) => grantPowerup(k), gui: () => scanGUI(), names: () => objectNames(true), source: (ti) => RT.classSource(ti), inRun: () => inRun(), livePatch: (c, m, h) => livePatch(c, m, h), injectPowerup: (t) => injectPowerup(t),
 rescan: () => RT.refresh(true), u32: (a) => RT.M.HEAPU32[a >>> 2], f32: (a) => RT.M.HEAPF32[a >>> 2],
 setU32: (a, v) => { RT.M.HEAPU32[a >>> 2] = v >>> 0; }, setF32: (a, v) => { RT.M.HEAPF32[a >>> 2] = v; },
 Module: () => getModule(), say,
@@ -2327,6 +2494,7 @@ if ((e.key === "h" || e.key === "H") && !e.ctrlKey && !e.metaKey && !e.altKey) F
 // ----- periodic refresh -----
 setInterval(() => {
 if (S.min) return;
+if (D.activeElement === leOut) return; // don't clobber Live Edit typing
 swDraws.forEach((f) => { try { f(); } catch (e) {} });
 const M = getModule();
 let state = "bad", text;
